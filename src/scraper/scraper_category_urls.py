@@ -1,0 +1,17 @@
+CATEGORY_URLS = {
+    "cat_abbigliamento": "https://www.amazon.it/deals/?bubble-id=deals-collection-fashion-and-accessories",
+    "cat_elettronica": "https://www.amazon.it/offerte-del-giorno-elettronica/s?k=offerte+del+giorno+elettronica",
+    "cat_casa_cucina": "https://www.amazon.it/Casa-cucina-Offerte-del-giorno/s?rh=n%3A524015031%2Cp_n_deal_type%3A26901107031",
+    "cat_bellezza": "https://www.amazon.it/Bellezza-Offerte-del-giorno/s?rh=n%3A6198082031%2Cp_n_deal_type%3A26901107031",
+    "cat_sport": "https://www.amazon.it/Sport-tempo-libero-Offerte-del-giorno/s?rh=n%3A524012031%2Cp_n_deal_type%3A26901107031",
+    "cat_giocattoli": "https://www.amazon.it/Giochi-giocattoli-Offerte-del-giorno/s?rh=n%3A523997031%2Cp_n_deal_type%3A26901107031",
+    "cat_faidate": "https://www.amazon.it/s?k=offerte+fai+da+te",
+    "cat_auto_moto": "https://www.amazon.it/s?k=offerte+auto+moto",
+    "cat_libri": "https://www.amazon.it/s?k=offerte+libri",
+    "cat_videogiochi": "https://www.amazon.it/Videogiochi-Offerte-del-giorno/s?rh=n%3A412603031%2Cp_n_specials_match%3A21618242031",
+    "cat_alimentari": "https://www.amazon.it/alimentari/s?k=alimentari",
+    "cat_animali": "https://www.amazon.it/s?k=offerte+animali",
+    "cat_deals": "https://www.amazon.it/deals/",
+    "cat_goldbox": "https://www.amazon.it/gp/goldbox",
+    "cat_all": "https://www.amazon.it/s?k=offerte+lampo+amazon",
+}

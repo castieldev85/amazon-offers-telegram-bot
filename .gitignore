@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+env/
+ENV/
+
+# Ambiente / segreti
+.env
+.env.*
+!.env.example
+
+# Log
+*.log
+log.txt
+bot.log
+scheduler_error.log
+
+# Dati runtime
+user_data.json
+link_map.json
+rejected_offers.json
+*.db
+*.sqlite
+*.sqlite3
+
+# Buffer e risultati
+buffer_storage/*.json
+search_results/*.json
+temp/
+tmp/
+
+# Sistema
+.DS_Store
+._*
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Output
+*.zip
+*.rar
