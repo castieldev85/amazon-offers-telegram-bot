@@ -451,11 +451,13 @@ The maintainer is not responsible for misuse, policy violations, account restric
 
 ## License
 
-No license has been selected yet.
+This project is **not open source**.
 
-Without a license, all rights are reserved by default.
+The source code is publicly visible for review, learning, and evaluation purposes only.
 
-A license may be added in the future depending on the intended distribution model.
+All rights are reserved. You are not allowed to sell, resell, redistribute, repackage, host, publish, or commercially exploit this software or modified versions without explicit written permission from the copyright holder.
+
+See the [LICENSE](LICENSE) file for details.
 
 ---
 
