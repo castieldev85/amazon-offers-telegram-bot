@@ -4,11 +4,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from src.buffer.buffer_manager import add_products_to_buffer, count_products_in_buffer
 from src.configs.settings import ENABLE_INSTANT_POST_AFTER_REFILL, MIN_OFFER_SCORE, REFILL_BATCH_SIZE
-from src.database.user_data_manager import get_user_min_discount
+from src.database.user_data_manager import get_user_min_discount, get_user_category_scrolls, get_user_category_pages
 from src.scraper.product_scraper import extract_product_info
 from src.utils.amazon_api_helper import search_products_by_keyword
 from src.utils.database_builder import get_last_posted_date, is_valid_for_resend
-from src.utils.offer_scorer import score_super_offer, parse_price
+from src.utils.offer_scorer import score_super_offer, parse_price, get_effective_discount_percent
 from src.buffer.rejected_offers import is_rejected_asin
 
 logger = logging.getLogger(__name__)
@@ -69,14 +69,17 @@ def _dedupe_asins(asins: list[str]) -> list[str]:
     return out
 
 
-def _source_asins(category_code: str, asin_source_fn, min_discount: int, max_products: int) -> list[str]:
+def _source_asins(category_code: str, asin_source_fn, min_discount: int, max_products: int, max_scrolls: int, max_pages: int) -> list[str]:
     try:
-        all_asins = asin_source_fn() or []
+        all_asins = asin_source_fn(max_scrolls=max_scrolls, max_pages=max_pages) or []
     except TypeError:
-        all_asins = asin_source_fn(category_code) or []
+        try:
+            all_asins = asin_source_fn() or []
+        except TypeError:
+            all_asins = asin_source_fn(category_code) or []
 
     all_asins = _dedupe_asins(all_asins)
-    logger.info(f"[REFILL] ASIN iniziali trovati per {category_code}: {len(all_asins)}")
+    logger.info(f"[REFILL] ASIN iniziali trovati per {category_code}: {len(all_asins)} | scroll={max_scrolls} | pagine={max_pages}")
 
     if len(all_asins) < 10:
         kw = KEYWORD_MAP.get(category_code, "offerte amazon")
@@ -114,7 +117,9 @@ def refill_buffer_for_user(user_id: int, category_code: str, asin_source_fn):
             return
 
         min_discount = get_user_min_discount(user_id)
-        selected_asins = _source_asins(category_code, asin_source_fn, min_discount, max_products)
+        max_scrolls = get_user_category_scrolls(user_id)
+        max_pages = get_user_category_pages(user_id)
+        selected_asins = _source_asins(category_code, asin_source_fn, min_discount, max_products, max_scrolls, max_pages)
         final_products = []
 
         def process(asin: str):
@@ -148,11 +153,19 @@ def refill_buffer_for_user(user_id: int, category_code: str, asin_source_fn):
                 return None
 
             score = score_super_offer(product, category=category_code)
-            if discount >= min_discount or score >= MIN_OFFER_SCORE:
-                logger.info(f"[REFILL] OK {asin} discount={discount}% score={score} price={product.price}€")
+            effective_discount = get_effective_discount_percent(product, category=category_code)
+
+            if effective_discount >= float(min_discount or 0) and score >= MIN_OFFER_SCORE:
+                logger.info(
+                    f"[REFILL] OK {asin} sconto_effettivo={effective_discount}% "
+                    f"filtro={min_discount}% score={score} price={product.price}€"
+                )
                 return product
 
-            logger.info(f"[REFILL] Skip {asin}: discount={discount}% < {min_discount}% e score={score} < {MIN_OFFER_SCORE}")
+            logger.info(
+                f"[REFILL] Skip {asin}: sconto_effettivo={effective_discount}% < {min_discount}% "
+                f"oppure score={score} < {MIN_OFFER_SCORE} | raw_discount={discount}%"
+            )
             return None
 
         batch_size = max(1, int(REFILL_BATCH_SIZE))

@@ -439,13 +439,15 @@ def build_offer_message(product, user_id, category_name="Offerte"):
     if promo_code_raw:
         message += f"🎟️ Codice: `{promo_code}`\n"
 
-    # Mostriamo lo sconto totale solo se aggiunge valore e non è un dato rumoroso.
+    # Mostriamo lo sconto totale solo se aggiunge valore rispetto allo sconto base.
+    # Evita doppioni tipo: Prima -21,4% + Risparmio stimato -21,4%.
     if (
         total_estimated_discount is not None
         and total_estimated_discount > 0
         and total_estimated_discount <= 70
-        and (show_final_price or show_old_price)
-        and (show_old_price or has_coupon or promo_code_raw)
+        and show_final_price
+        and (has_coupon or promo_code_raw)
+        and (not reliable_discount or float(total_estimated_discount) >= float(reliable_discount) + 3)
     ):
         total_discount_text = escape_md(_format_discount(total_estimated_discount))
         message += f"🚀 Risparmio stimato: \\-{total_discount_text}%\n"

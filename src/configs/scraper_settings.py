@@ -7,3 +7,6 @@ SCROLL_AMOUNT_PX = 500
 DEFAULT_MIN_DISCOUNT_LABEL = "3"
 DEFAULT_MIN_DISCOUNT_PERCENT = 20
 
+
+# Paginazione categoria: oltre allo scroll, il bot può aprire le pagine successive.
+DEFAULT_CATEGORY_MAX_PAGES = int(__import__("os").getenv("DEFAULT_CATEGORY_MAX_PAGES", "2"))

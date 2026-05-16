@@ -16,7 +16,11 @@ DEFAULT_USER_DATA: dict[str, Any] = {
     "offers_per_cycle": 1,
     "buffer_clear_days": 0,
     "last_buffer_clear": 0,
+    "category_scrolls": 8,
+    "category_pages": 2,
     "telegram_channels": [],
+    "telegram_source_channels": [],
+    "telegram_source_limit": 30,
     "watchlist": [],
 }
 
@@ -211,6 +215,40 @@ def set_user_offers_per_cycle(user_id: int, count: int):
         _save_user_data_unlocked(data)
 
 
+def get_user_category_scrolls(user_id: int) -> int:
+    data = ensure_user_entry(user_id)
+    try:
+        value = int(data.get(str(user_id), {}).get("category_scrolls", 8))
+        return max(1, min(value, 30))
+    except Exception:
+        return 8
+
+
+def set_user_category_scrolls(user_id: int, scrolls: int):
+    with _USER_DATA_LOCK:
+        data = ensure_user_entry(user_id)
+        value = max(1, min(int(scrolls), 30))
+        data[str(user_id)]["category_scrolls"] = value
+        _save_user_data_unlocked(data)
+
+
+
+def get_user_category_pages(user_id: int) -> int:
+    data = ensure_user_entry(user_id)
+    try:
+        value = int(data.get(str(user_id), {}).get("category_pages", 2))
+        return max(1, min(value, 10))
+    except Exception:
+        return 2
+
+
+def set_user_category_pages(user_id: int, pages: int):
+    with _USER_DATA_LOCK:
+        data = ensure_user_entry(user_id)
+        value = max(1, min(int(pages), 10))
+        data[str(user_id)]["category_pages"] = value
+        _save_user_data_unlocked(data)
+
 def get_user_min_rating(user_id: int) -> float:
     data = ensure_user_entry(user_id)
     try:
@@ -253,4 +291,81 @@ def set_user_max_price(user_id: int, price: float | None):
     with _USER_DATA_LOCK:
         data = ensure_user_entry(user_id)
         data[str(user_id)]["max_price"] = price
+        _save_user_data_unlocked(data)
+
+
+
+def get_user_telegram_source_channels(user_id: int) -> list[str]:
+    """Restituisce le fonti Telegram salvate.
+
+    V3.10: le fonti vengono salvate anche in telegram_sources.json per non
+    perderle al riavvio o durante migrazioni di user_data.json. Se il nuovo
+    store è vuoto, migra automaticamente i vecchi valori da user_data.json.
+    """
+    from src.telegram_sources.source_store import get_sources, set_sources
+
+    stored = get_sources(user_id)
+    if stored:
+        return stored
+
+    data = ensure_user_entry(user_id)
+    legacy = data.get(str(user_id), {}).get("telegram_source_channels", [])
+    if isinstance(legacy, list) and legacy:
+        set_sources(user_id, legacy)
+        return legacy
+    return []
+
+
+def add_user_telegram_source_channel(user_id: int, channel: str):
+    from src.telegram_sources.importer import normalize_channel_name, TELEGRAM_SOURCE_CATEGORY
+    from src.telegram_sources.source_store import add_source
+
+    clean = normalize_channel_name(channel)
+    if not clean:
+        raise ValueError("Canale Telegram non valido")
+
+    # Salvataggio persistente separato, robusto al riavvio.
+    add_source(user_id, clean)
+
+    # Mantengo anche il valore legacy in user_data.json per compatibilità.
+    with _USER_DATA_LOCK:
+        data = ensure_user_entry(user_id)
+        uid = str(user_id)
+        sources = data[uid].setdefault("telegram_source_channels", [])
+        if clean not in sources:
+            sources.append(clean)
+        categories = data[uid].setdefault("categories", [])
+        if TELEGRAM_SOURCE_CATEGORY not in categories:
+            categories.append(TELEGRAM_SOURCE_CATEGORY)
+        _save_user_data_unlocked(data)
+
+
+def remove_user_telegram_source_channel(user_id: int, channel: str):
+    from src.telegram_sources.importer import normalize_channel_name
+    from src.telegram_sources.source_store import remove_source
+
+    clean = normalize_channel_name(channel)
+    remove_source(user_id, clean)
+
+    with _USER_DATA_LOCK:
+        data = ensure_user_entry(user_id)
+        uid = str(user_id)
+        sources = data[uid].setdefault("telegram_source_channels", [])
+        data[uid]["telegram_source_channels"] = [x for x in sources if normalize_channel_name(x) != clean]
+        _save_user_data_unlocked(data)
+
+
+def get_user_telegram_source_limit(user_id: int) -> int:
+    data = ensure_user_entry(user_id)
+    try:
+        value = int(data.get(str(user_id), {}).get("telegram_source_limit", 30))
+        return max(5, min(value, 200))
+    except Exception:
+        return 30
+
+
+def set_user_telegram_source_limit(user_id: int, limit: int):
+    with _USER_DATA_LOCK:
+        data = ensure_user_entry(user_id)
+        data[str(user_id)]["telegram_source_limit"] = max(5, min(int(limit), 200))
         _save_user_data_unlocked(data)

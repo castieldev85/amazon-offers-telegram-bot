@@ -146,30 +146,83 @@ def _extract_title(driver) -> str:
     return "Titolo non trovato"
 
 
-def _extract_price(driver) -> str:
-    # Tentativi ordinati dal più affidabile al meno affidabile
-    attempts = [
-        lambda: _clean_price_text(driver.find_element(By.CSS_SELECTOR, ".a-price.aok-align-center .a-offscreen").text),
-        lambda: _clean_price_text(driver.find_element(By.CSS_SELECTOR, ".a-price .a-offscreen").text),
-        lambda: _clean_price_text(
-            f"{driver.find_element(By.CSS_SELECTOR, '.a-price .a-price-whole').text}"
-            f".{driver.find_element(By.CSS_SELECTOR, '.a-price .a-price-fraction').text}"
-        ),
-        lambda: _clean_price_text(driver.find_element(By.ID, "priceblock_ourprice").text),
-        lambda: _clean_price_text(driver.find_element(By.ID, "priceblock_dealprice").text),
-        lambda: _clean_price_text(driver.find_element(By.ID, "price_inside_buybox").text),
-    ]
+def _text_or_attr(driver, by, selector) -> str:
+    try:
+        el = driver.find_element(by, selector)
+        txt = (el.text or "").strip()
+        if not txt:
+            txt = (el.get_attribute("textContent") or el.get_attribute("innerText") or el.get_attribute("aria-label") or "").strip()
+        return txt
+    except Exception:
+        return ""
 
-    for fn in attempts:
-        try:
-            value = fn()
-            if value and value != "N/D":
-                return value
-        except Exception:
-            continue
 
+def _extract_json_ld_price(driver) -> str:
+    try:
+        import json
+        scripts = driver.find_elements(By.CSS_SELECTOR, "script[type='application/ld+json']")
+        for script in scripts:
+            raw = script.get_attribute("textContent") or ""
+            if not raw.strip():
+                continue
+            try:
+                data = json.loads(raw)
+            except Exception:
+                continue
+            blocks = data if isinstance(data, list) else [data]
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                offers = block.get("offers")
+                if isinstance(offers, list) and offers:
+                    offers = offers[0]
+                if isinstance(offers, dict):
+                    for key in ("price", "lowPrice", "highPrice"):
+                        val = offers.get(key)
+                        cleaned = _clean_price_text(str(val or ""))
+                        if _safe_float(cleaned) is not None:
+                            return cleaned
+    except Exception:
+        pass
     return "N/D"
 
+
+def _extract_price(driver) -> str:
+    # Tentativi ordinati dal più affidabile al meno affidabile.
+    # Usiamo anche textContent perché .a-offscreen spesso è nascosto e Selenium .text torna vuoto.
+    selectors = [
+        (By.CSS_SELECTOR, "#corePriceDisplay_desktop_feature_div span.a-price span.a-offscreen"),
+        (By.CSS_SELECTOR, "#corePrice_feature_div span.a-price span.a-offscreen"),
+        (By.CSS_SELECTOR, "#apex_desktop span.a-price span.a-offscreen"),
+        (By.CSS_SELECTOR, ".a-price.aok-align-center .a-offscreen"),
+        (By.CSS_SELECTOR, ".apexPriceToPay span.a-offscreen"),
+        (By.CSS_SELECTOR, ".a-price .a-offscreen"),
+        (By.ID, "priceblock_ourprice"),
+        (By.ID, "priceblock_dealprice"),
+        (By.ID, "price_inside_buybox"),
+    ]
+
+    for by, selector in selectors:
+        txt = _text_or_attr(driver, by, selector)
+        value = _clean_price_text(txt)
+        if value and value != "N/D" and _safe_float(value) is not None:
+            return value
+
+    try:
+        whole = _text_or_attr(driver, By.CSS_SELECTOR, ".a-price .a-price-whole")
+        fraction = _text_or_attr(driver, By.CSS_SELECTOR, ".a-price .a-price-fraction")
+        if whole:
+            value = _clean_price_text(f"{whole},{fraction or '00'}")
+            if value and value != "N/D" and _safe_float(value) is not None:
+                return value
+    except Exception:
+        pass
+
+    json_price = _extract_json_ld_price(driver)
+    if json_price != "N/D":
+        return json_price
+
+    return "N/D"
 
 def _extract_old_price(driver, current_price: str) -> str:
     selectors = [
@@ -188,7 +241,8 @@ def _extract_old_price(driver, current_price: str) -> str:
         try:
             elements = driver.find_elements(By.CSS_SELECTOR, sel)
             for el in elements:
-                txt = _clean_price_text(el.text)
+                raw_txt = (el.text or el.get_attribute("textContent") or el.get_attribute("innerText") or el.get_attribute("aria-label") or "")
+                txt = _clean_price_text(raw_txt)
                 val = _safe_float(txt)
                 if val is not None:
                     candidates.append((txt, val))
@@ -266,7 +320,17 @@ def _extract_image(driver) -> str:
     for by, selector in selectors:
         try:
             el = driver.find_element(by, selector)
-            src = el.get_attribute("src") or el.get_attribute("data-old-hires") or ""
+            src = el.get_attribute("data-old-hires") or el.get_attribute("src") or ""
+            if not src:
+                raw_dynamic = el.get_attribute("data-a-dynamic-image") or ""
+                if raw_dynamic:
+                    try:
+                        import json
+                        data = json.loads(raw_dynamic)
+                        if isinstance(data, dict) and data:
+                            src = max(data.keys(), key=len)
+                    except Exception:
+                        pass
             if src:
                 return src.strip()
         except Exception:

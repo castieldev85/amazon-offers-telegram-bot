@@ -5,6 +5,7 @@ import time
 from typing import Any, Dict
 
 import requests
+from PIL import Image, ImageStat
 
 from src.database.user_data_manager import load_user_data, save_user_data
 from src.utils.shortlink_generator import generate_affiliate_link
@@ -91,6 +92,57 @@ def _format_discount(value) -> str:
         return "0"
 
 
+
+
+def _prepare_facebook_image(image_path: str) -> str | None:
+    """Prepara una JPEG valida per Facebook e ritorna il path da caricare.
+
+    Su Windows/Graph API alcuni upload possono risultare anomali se il file è
+    progressivo, ha alpha channel o metadata strani. Convertiamo sempre in RGB
+    JPEG standard e controlliamo che non sia un file vuoto/illeggibile.
+    """
+    if not image_path:
+        return None
+
+    image_path = os.path.abspath(str(image_path))
+    if not os.path.exists(image_path):
+        logger.warning(f"[FACEBOOK] ⚠️ File immagine non trovato: {image_path}")
+        return None
+
+    try:
+        if os.path.getsize(image_path) < 1024:
+            logger.warning(f"[FACEBOOK] ⚠️ File immagine troppo piccolo: {image_path}")
+            return None
+
+        with Image.open(image_path) as im:
+            im = im.convert("RGB")
+            w, h = im.size
+            if w < 200 or h < 200:
+                logger.warning(f"[FACEBOOK] ⚠️ Immagine troppo piccola per Facebook: {w}x{h}")
+                return None
+
+            # Se l'immagine è quasi completamente bianca/monocolore, la segnaliamo
+            # ma la pubblichiamo comunque: può essere un placeholder intenzionale.
+            try:
+                stat = ImageStat.Stat(im.resize((32, 32)))
+                variance = sum(stat.var) / max(len(stat.var), 1)
+                if variance < 3:
+                    logger.warning(f"[FACEBOOK] ⚠️ Immagine quasi vuota/monocolore: variance={variance:.2f}")
+            except Exception:
+                pass
+
+            out_dir = os.path.join(os.path.dirname(image_path), "facebook_ready")
+            os.makedirs(out_dir, exist_ok=True)
+            base = os.path.splitext(os.path.basename(image_path))[0]
+            out_path = os.path.join(out_dir, f"{base}_fb.jpg")
+            im.save(out_path, format="JPEG", quality=92, optimize=False, progressive=False)
+
+        logger.info(f"[FACEBOOK] 🖼️ Immagine preparata per upload: {out_path} ({os.path.getsize(out_path)} bytes)")
+        return out_path
+    except Exception:
+        logger.exception(f"[FACEBOOK] ❌ Impossibile preparare immagine Facebook: {image_path}")
+        return None
+
 def publish_to_facebook_file(user_id: int, image_path: str, caption: str) -> bool:
     logger.info(f"[FACEBOOK] ▶️ Inizio pubblicazione per user {user_id}")
     logger.info(f"[FACEBOOK] ✅ Immagine: {image_path}")
@@ -107,8 +159,9 @@ def publish_to_facebook_file(user_id: int, image_path: str, caption: str) -> boo
         logger.warning("[FACEBOOK] ⚠️ Configurazione mancante")
         return False
 
-    if not image_path or not os.path.exists(image_path):
-        logger.warning(f"[FACEBOOK] ⚠️ File immagine non trovato: {image_path}")
+    upload_image_path = _prepare_facebook_image(image_path)
+    if not upload_image_path:
+        logger.warning(f"[FACEBOOK] ⚠️ Immagine non valida, salto Facebook: {image_path}")
         return False
 
     url = f"https://graph.facebook.com/{API_VERSION}/{page_id}/photos"
@@ -117,15 +170,19 @@ def publish_to_facebook_file(user_id: int, image_path: str, caption: str) -> boo
         try:
             logger.info(f"[FACEBOOK] 🚀 Invio richiesta a Facebook Graph API... tentativo {i}/{MAX_ATTEMPTS}")
 
-            with open(image_path, "rb") as img:
+            with open(upload_image_path, "rb") as img:
+                filename = os.path.basename(upload_image_path)
                 res = requests.post(
                     url,
                     data={
+                        "message": caption,
                         "caption": caption,
-                        "access_token": token
+                        "published": "true",
+                        "no_story": "false",
+                        "access_token": token,
                     },
-                    files={"source": img},
-                    timeout=60
+                    files={"source": (filename, img, "image/jpeg")},
+                    timeout=90,
                 )
 
             logger.info(f"[FACEBOOK] Tentativo {i}/{MAX_ATTEMPTS} - Status Code: {res.status_code}")

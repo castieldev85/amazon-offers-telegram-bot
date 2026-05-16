@@ -7,8 +7,16 @@ from bs4 import BeautifulSoup
 
 from src.utils.product import Product
 from src.utils.amazon_api_helper import fetch_product_details_from_api
+from src.configs.settings import (
+    ASIN_DETAIL_ENABLE_SELENIUM_FALLBACK,
+    ASIN_DETAIL_SELENIUM_MAX_PER_REFILL,
+)
 
 logger = logging.getLogger(__name__)
+
+# Evita che un refill parallelo apra troppi Chrome contemporaneamente solo per recuperare prezzi mancanti.
+import threading
+_SELENIUM_DETAIL_SEMAPHORE = threading.BoundedSemaphore(max(1, int(ASIN_DETAIL_SELENIUM_MAX_PER_REFILL)))
 
 
 # ---------------------------------------------------------
@@ -92,6 +100,45 @@ def to_float(value):
         return float(v) if v else 0.0
     except Exception:
         return 0.0
+
+
+
+
+def _safe_asin(value) -> str:
+    """
+    Normalizza e valida un ASIN Amazon.
+
+    Accetta anche link o testi sporchi e prova a estrarre il primo ASIN valido.
+    Ritorna stringa vuota se non trova un ASIN valido.
+    """
+    if value is None:
+        return ""
+
+    raw = str(value).strip().upper()
+    if not raw:
+        return ""
+
+    # Se arriva un link Amazon, estraggo l'ASIN da /dp/, /gp/product/ o qualunque token valido.
+    patterns = [
+        r"/(?:DP|GP/PRODUCT)/([A-Z0-9]{10})(?:[/?#]|$)",
+        r"(?:ASIN=|ASIN%3D)([A-Z0-9]{10})",
+        r"\b([A-Z0-9]{10})\b",
+    ]
+
+    for pattern in patterns:
+        m = re.search(pattern, raw, re.IGNORECASE)
+        if m:
+            candidate = m.group(1).strip().upper()
+            if re.fullmatch(r"[A-Z0-9]{10}", candidate):
+                return candidate
+
+    # Ultimo fallback: tolgo caratteri non alfanumerici e controllo lunghezza.
+    cleaned = re.sub(r"[^A-Z0-9]", "", raw)
+    if re.fullmatch(r"[A-Z0-9]{10}", cleaned):
+        return cleaned
+
+    logger.warning(f"[ASIN-DETAIL] ASIN non valido/scartato: {value}")
+    return ""
 
 
 def normalize_discount(value) -> float:
@@ -288,6 +335,331 @@ def _is_old_price_credible(price: float, old_price: float, has_coupon: bool, pro
 
     return True
 
+
+
+# ---------------------------------------------------------
+# 🧠 HTML FALLBACK AVANZATO ASIN
+# ---------------------------------------------------------
+def _extract_json_ld_blocks(soup) -> list[dict]:
+    blocks: list[dict] = []
+    try:
+        for tag in soup.select("script[type='application/ld+json']"):
+            raw = tag.string or tag.get_text(" ", strip=True)
+            if not raw:
+                continue
+            try:
+                data = __import__('json').loads(raw)
+            except Exception:
+                continue
+            if isinstance(data, list):
+                blocks.extend([x for x in data if isinstance(x, dict)])
+            elif isinstance(data, dict):
+                blocks.append(data)
+    except Exception:
+        pass
+    return blocks
+
+
+def _extract_price_from_json_ld(soup) -> float | None:
+    """Legge il prezzo da JSON-LD, quando Amazon lo espone."""
+    for block in _extract_json_ld_blocks(soup):
+        try:
+            offers = block.get("offers")
+            if isinstance(offers, list) and offers:
+                offers = offers[0]
+            if isinstance(offers, dict):
+                for key in ("price", "lowPrice", "highPrice"):
+                    val = to_float(offers.get(key))
+                    if val > 0:
+                        return val
+        except Exception:
+            continue
+    return None
+
+
+def _extract_title_from_json_ld(soup) -> str | None:
+    for block in _extract_json_ld_blocks(soup):
+        try:
+            name = clean_title(block.get("name") or "")
+            if name and len(name) >= 6:
+                return name
+        except Exception:
+            continue
+    return None
+
+
+def _extract_image_from_json_ld(soup) -> str | None:
+    for block in _extract_json_ld_blocks(soup):
+        try:
+            image = block.get("image")
+            if isinstance(image, list) and image:
+                image = image[0]
+            if image and isinstance(image, str) and image.startswith("http"):
+                return image.strip()
+        except Exception:
+            continue
+    return None
+
+
+def _extract_meta_price(soup) -> float | None:
+    selectors = [
+        "meta[property='product:price:amount']",
+        "meta[name='twitter:data1']",
+        "meta[property='og:price:amount']",
+        "meta[itemprop='price']",
+    ]
+    for sel in selectors:
+        try:
+            tag = soup.select_one(sel)
+            if not tag:
+                continue
+            value = to_float(tag.get("content") or tag.get("value") or "")
+            if value > 0:
+                return value
+        except Exception:
+            continue
+    return None
+
+
+def _extract_image_from_html_soup(soup) -> str | None:
+    selectors = [
+        "#landingImage",
+        "#imgBlkFront",
+        "#main-image",
+        "#imgTagWrapperId img",
+        "img.a-dynamic-image",
+        "meta[property='og:image']",
+    ]
+    for sel in selectors:
+        try:
+            tag = soup.select_one(sel)
+            if not tag:
+                continue
+            if tag.name == "meta":
+                src = tag.get("content")
+            else:
+                src = tag.get("data-old-hires") or tag.get("src") or ""
+                if not src:
+                    raw_dynamic = tag.get("data-a-dynamic-image") or ""
+                    if raw_dynamic:
+                        try:
+                            import json
+                            data = json.loads(raw_dynamic)
+                            if isinstance(data, dict) and data:
+                                src = max(data.keys(), key=len)
+                        except Exception:
+                            pass
+            if src and str(src).startswith("http"):
+                return str(src).strip()
+        except Exception:
+            continue
+    return None
+
+
+def _page_says_unavailable(soup) -> bool:
+    try:
+        text = _normalize_spaces(soup.get_text(" ", strip=True)).lower()
+        signals = [
+            "attualmente non disponibile",
+            "non sappiamo se o quando l'articolo sarà di nuovo disponibile",
+            "non disponibile",
+            "currently unavailable",
+        ]
+        return any(sig in text for sig in signals)
+    except Exception:
+        return False
+
+
+def enrich_product_from_html(asin: str, product: Product | None = None) -> dict:
+    """
+    Legge una sola volta la pagina HTML e restituisce tutti i dettagli recuperabili.
+    Serve per evitare 3 richieste separate HTML per titolo/prezzo/coupon/promo.
+    """
+    soup = _fetch_product_soup(asin)
+    if not soup:
+        return {}
+
+    info: dict = {"unavailable": _page_says_unavailable(soup)}
+
+    # Titolo
+    for sel in ["#productTitle", "span#productTitle", "h1.a-size-large", "meta[property='og:title']"]:
+        try:
+            el = soup.select_one(sel)
+            if not el:
+                continue
+            title = el.get("content") if el.name == "meta" else el.get_text(" ", strip=True)
+            title = clean_title(title)
+            if title and len(title) >= 6:
+                info["title"] = title
+                break
+        except Exception:
+            continue
+    if not info.get("title"):
+        json_title = _extract_title_from_json_ld(soup)
+        if json_title:
+            info["title"] = json_title
+
+    # Immagine
+    image = _extract_image_from_html_soup(soup) or _extract_image_from_json_ld(soup)
+    if image:
+        info["image"] = image
+
+    # Prezzo attuale
+    price_selectors = [
+        "#corePriceDisplay_desktop_feature_div span.a-price span.a-offscreen",
+        "#corePrice_feature_div span.a-price span.a-offscreen",
+        "#apex_desktop span.a-price span.a-offscreen",
+        "span.apexPriceToPay span.a-offscreen",
+        "span.a-price.aok-align-center span.a-offscreen",
+        "span#priceblock_ourprice",
+        "span#priceblock_dealprice",
+        "span#price_inside_buybox",
+        "span.a-price span.a-offscreen",
+    ]
+    price = None
+    for sel in price_selectors:
+        try:
+            for tag in soup.select(sel):
+                value = to_float(tag.get_text(" ", strip=True) or tag.get("aria-label") or "")
+                if value > 0:
+                    price = value
+                    break
+            if price:
+                break
+        except Exception:
+            continue
+    if not price:
+        price = _extract_meta_price(soup) or _extract_price_from_json_ld(soup)
+    if price and price > 0:
+        info["price"] = price
+
+    # Vecchio prezzo / prezzo barrato
+    old_price_selectors = [
+        "span.a-price.a-text-price span.a-offscreen",
+        "span.basisPrice span.a-offscreen",
+        "#corePriceDisplay_desktop_feature_div span.a-text-price span.a-offscreen",
+        "span.a-list-price",
+        "span#listPriceValue",
+        "span.priceBlockStrikePriceString",
+        ".a-text-strike",
+    ]
+    old_candidates = []
+    for sel in old_price_selectors:
+        try:
+            for tag in soup.select(sel):
+                value = to_float(tag.get_text(" ", strip=True) or tag.get("aria-label") or "")
+                if value > 0:
+                    old_candidates.append(value)
+        except Exception:
+            continue
+    if old_candidates:
+        current = price or 0
+        bigger = [v for v in old_candidates if v > current]
+        if bigger:
+            info["old_price"] = max(bigger)
+
+    # Coupon
+    coupon_candidates = []
+    for sel in [
+        "#couponFeature",
+        "#voucherNode_feature_div",
+        "div[data-feature-name='couponFeature']",
+        "div[data-feature-name='voucherNode_feature_div']",
+        "#promoPriceBlockMessage_feature_div",
+        "#applicablePromotionList_feature_div",
+    ]:
+        try:
+            for el in soup.select(sel):
+                cleaned = clean_coupon_text(el.get_text(" ", strip=True))
+                if cleaned:
+                    coupon_candidates.append(cleaned)
+        except Exception:
+            continue
+    if not coupon_candidates:
+        full_text = _normalize_spaces(soup.get_text(" ", strip=True))
+        for pattern in COUPON_PATTERNS:
+            for match in re.findall(pattern, full_text, flags=re.IGNORECASE):
+                cleaned = clean_coupon_text(match)
+                if cleaned:
+                    coupon_candidates.append(cleaned)
+    if coupon_candidates:
+        seen = set()
+        clean = []
+        for c in coupon_candidates:
+            k = c.lower().strip()
+            if k and k not in seen:
+                seen.add(k)
+                clean.append(c)
+        if clean:
+            info["has_coupon"] = True
+            info["coupon_text"] = clean[0]
+
+    # Promo code
+    texts = []
+    for sel in [
+        "#promoPriceBlockMessage_feature_div",
+        "#applicablePromotionList_feature_div",
+        "#promotions_feature_div",
+        "div[data-feature-name='applicablePromotionList']",
+    ]:
+        try:
+            texts.extend([_normalize_spaces(el.get_text(" ", strip=True)) for el in soup.select(sel)])
+        except Exception:
+            continue
+    if not texts:
+        texts.append(_normalize_spaces(soup.get_text(" ", strip=True)))
+    for txt in texts:
+        up = txt.upper()
+        for pattern in [r"applica\s+il\s+codice\s+([A-Z0-9]{4,20})", r"usa\s+il\s+codice\s+([A-Z0-9]{4,20})", r"codice\s+([A-Z0-9]{4,20})"]:
+            m = re.search(pattern, up, re.IGNORECASE)
+            if m:
+                info["promo_code"] = m.group(1).strip().upper()
+                return info
+
+    return info
+
+
+def _selenium_detail_fallback(asin: str) -> dict:
+    """
+    Ultima spiaggia: apre la pagina prodotto con Selenium solo se API/HTML non hanno prezzo.
+    Limitata da semaforo per non aprire troppi Chrome in parallelo.
+    """
+    if not ASIN_DETAIL_ENABLE_SELENIUM_FALLBACK:
+        return {}
+    try:
+        from src.utils.extract_product_info_selenium import extract_product_info_selenium
+    except Exception as e:
+        logger.warning(f"[SELENIUM-FALLBACK] Non disponibile per ASIN {asin}: {e}")
+        return {}
+
+    url = f"https://www.amazon.it/dp/{asin}?th=1&psc=1"
+    acquired = _SELENIUM_DETAIL_SEMAPHORE.acquire(timeout=180)
+    if not acquired:
+        logger.warning(f"[SELENIUM-FALLBACK] Timeout semaforo per ASIN {asin}")
+        return {}
+    try:
+        logger.warning(f"[SELENIUM-FALLBACK] Avvio dettaglio prodotto per ASIN {asin}")
+        prod = extract_product_info_selenium(url)
+        if not prod:
+            return {}
+        return {
+            "title": clean_title(getattr(prod, "title", "") or ""),
+            "price": to_float(getattr(prod, "price", 0)),
+            "old_price": to_float(getattr(prod, "old_price", 0)),
+            "discount": normalize_discount(getattr(prod, "discount", 0)),
+            "image": getattr(prod, "image", None),
+            "has_coupon": bool(getattr(prod, "has_coupon", False)),
+            "promo_code": getattr(prod, "promo_code", None),
+            "is_limited_offer": bool(getattr(prod, "is_limited_offer", False)),
+        }
+    except Exception as e:
+        logger.exception(f"[SELENIUM-FALLBACK] Errore ASIN {asin}: {e}")
+        return {}
+    finally:
+        try:
+            _SELENIUM_DETAIL_SEMAPHORE.release()
+        except Exception:
+            pass
 
 # ---------------------------------------------------------
 # 🕷️ HTML FALLBACK PREZZO
@@ -538,19 +910,34 @@ def extract_promo_code_from_html(asin: str):
 # ---------------------------------------------------------
 def extract_product_info(asin: str) -> Product | None:
     """
-    Estrae i dati di un prodotto usando:
+    Estrae i dati di un prodotto usando pipeline robusta:
     1) Amazon PA-API
-    2) fallback HTML solo se il prezzo API manca o il titolo è sporco
-    3) lettura coupon/promo HTML solo come arricchimento
+    2) HTML Amazon in una sola richiesta
+    3) Selenium solo se il prezzo resta mancante/0
+
+    Obiettivo: evitare prodotti a prezzo 0 nel buffer e arricchire meglio ASIN, titolo, immagine, coupon e prezzo barrato.
     """
     try:
-        product = fetch_product_details_from_api(asin)
-
-        if not product:
-            logger.error(f"[API] Nessun dato valido per ASIN {asin}")
+        asin = _safe_asin(asin)
+        if not asin:
             return None
 
-        # Dati base API
+        product = fetch_product_details_from_api(asin)
+
+        # Se PA-API non risponde, creo comunque una base vuota e provo HTML/Selenium.
+        if not product:
+            logger.warning(f"[ASIN-DETAIL] PA-API senza risultato → provo HTML/Selenium per ASIN {asin}")
+            product = Product(
+                asin=asin,
+                title="Prodotto Amazon",
+                price=0,
+                old_price=None,
+                discount=0,
+                image=None,
+                link=f"https://www.amazon.it/dp/{asin}",
+                category="Offerta",
+            )
+
         title = clean_title(getattr(product, "title", None) or "Prodotto Amazon")
         image = getattr(product, "image", None)
         link = getattr(product, "link", None)
@@ -569,52 +956,67 @@ def extract_product_info(asin: str) -> Product | None:
         if discount <= 0 and old_price > price > 0:
             discount = round(((old_price - price) / old_price) * 100, 1)
 
-        # Fallback titolo se sporco
-        if not title or _contains_title_noise(title) or len(title) < 8:
-            html_title = extract_title_from_html(asin)
-            if html_title:
-                logger.info(f"[HTML] Titolo migliorato per ASIN {asin}")
-                title = html_title
+        # Un solo passaggio HTML per recuperare tutti i dettagli mancanti/sporchi.
+        needs_html = (
+            price <= 0
+            or not image
+            or not title
+            or _contains_title_noise(title)
+            or len(title) < 8
+            or not coupon_text
+            or not promo_code
+        )
+        html_info = {}
+        if needs_html:
+            html_info = enrich_product_from_html(asin, product)
 
-        # Fallback HTML prezzo solo se il prezzo API manca
-        if price <= 0:
-            logger.warning(f"[API] Prezzo mancante → fallback HTML per ASIN {asin}")
-
-            html_price, html_old = extract_price_from_html(asin)
-
-            if not html_price or html_price <= 0:
-                logger.error(f"[HTML] Nessun prezzo trovato → scarto ASIN {asin}")
+            if html_info.get("unavailable") and price <= 0:
+                logger.info(f"[ASIN-DETAIL] ASIN {asin} non disponibile e senza prezzo → scarto")
                 return None
 
-            price = html_price
+            if html_info.get("title") and (_contains_title_noise(title) or len(title) < 8 or title == "Prodotto Amazon"):
+                title = html_info["title"]
 
-            if html_old and html_old > price:
-                old_price = html_old
-            elif old_price <= price:
-                old_price = 0.0
+            if html_info.get("image") and not image:
+                image = html_info["image"]
 
-            if old_price > price > 0:
-                discount = round(((old_price - price) / old_price) * 100, 1)
-            else:
-                discount = 0.0
+            if html_info.get("price") and to_float(html_info["price"]) > 0:
+                price = to_float(html_info["price"])
 
-        # Arricchimento coupon HTML
-        try:
-            html_has_coupon, html_coupon_text = extract_coupon_from_html(asin)
-            if html_has_coupon:
+            if html_info.get("old_price") and to_float(html_info["old_price"]) > price:
+                old_price = to_float(html_info["old_price"])
+
+            if html_info.get("has_coupon"):
                 has_coupon = True
-                coupon_text = clean_coupon_text(html_coupon_text) or html_coupon_text
-        except Exception as e:
-            logger.warning(f"[COUPON] Impossibile leggere coupon per ASIN {asin}: {e}")
+                coupon_text = clean_coupon_text(html_info.get("coupon_text")) or html_info.get("coupon_text")
 
-        # Arricchimento promo code HTML
-        try:
-            if not promo_code:
-                html_promo_code = extract_promo_code_from_html(asin)
-                if html_promo_code:
-                    promo_code = html_promo_code
-        except Exception as e:
-            logger.warning(f"[PROMO] Impossibile leggere promo code per ASIN {asin}: {e}")
+            if html_info.get("promo_code") and not promo_code:
+                promo_code = html_info["promo_code"]
+
+        # Ultima spiaggia: Selenium se il prezzo resta 0/N.D.
+        if price <= 0:
+            selenium_info = _selenium_detail_fallback(asin)
+            if selenium_info:
+                if selenium_info.get("price") and to_float(selenium_info["price"]) > 0:
+                    price = to_float(selenium_info["price"])
+                if selenium_info.get("old_price") and to_float(selenium_info["old_price"]) > price:
+                    old_price = to_float(selenium_info["old_price"])
+                if selenium_info.get("discount"):
+                    discount = normalize_discount(selenium_info.get("discount"))
+                if selenium_info.get("title") and (title == "Prodotto Amazon" or len(title) < 8):
+                    title = selenium_info["title"]
+                if selenium_info.get("image") and not image:
+                    image = selenium_info["image"]
+                if selenium_info.get("has_coupon"):
+                    has_coupon = True
+                if selenium_info.get("promo_code") and not promo_code:
+                    promo_code = selenium_info["promo_code"]
+                if selenium_info.get("is_limited_offer"):
+                    is_limited_offer = True
+
+        if price <= 0:
+            logger.warning(f"[ASIN-DETAIL] Scarto ASIN {asin}: prezzo ancora mancante dopo API+HTML+Selenium")
+            return None
 
         # Vecchio prezzo credibile?
         if old_price > 0 and not _is_old_price_credible(
@@ -629,8 +1031,6 @@ def extract_product_info(asin: str) -> Product | None:
                 f"price={price} old={old_price} discount={discount}"
             )
             old_price = 0.0
-
-            # Se lo sconto era basato su un vecchio prezzo assurdo, azzeralo
             if discount >= 85 and not has_coupon and not promo_code and not is_limited_offer:
                 discount = 0.0
 
@@ -641,15 +1041,14 @@ def extract_product_info(asin: str) -> Product | None:
         if discount < 0:
             discount = 0.0
 
-        # Supporto coupon: se non c'è discount ma c'è coupon, alza il minimo per farlo entrare nel buffer
+        # Supporto coupon: se non c'è discount ma c'è coupon, stima lo sconto coupon.
         if discount <= 0 and has_coupon:
             coupon_boost = _estimate_coupon_discount_percent(coupon_text, price)
             discount = max(10.0, coupon_boost if coupon_boost > 0 else 10.0)
 
-        # Normalizzazione finale
         title = clean_title(title) or "Prodotto Amazon"
         old_price_final = round(old_price, 2) if old_price > price > 0 else None
-        final_price = round(price, 2) if price > 0 else 0.0
+        final_price = round(price, 2)
         final_discount = round(discount, 1) if discount > 0 else 0.0
         final_link = link or f"https://www.amazon.it/dp/{asin}"
 
@@ -669,10 +1068,10 @@ def extract_product_info(asin: str) -> Product | None:
         )
 
         logger.info(
-            f"[DEBUG] {asin} → price={final_product.price}, "
+            f"[ASIN-DETAIL] OK {asin} → price={final_product.price}, "
             f"old={final_product.old_price}, discount={final_product.discount}, "
             f"coupon={final_product.coupon_text}, promo={final_product.promo_code}, "
-            f"title='{final_product.title[:90]}'"
+            f"image={'yes' if final_product.image else 'no'}, title='{final_product.title[:90]}'"
         )
 
         return final_product

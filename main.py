@@ -10,6 +10,7 @@ from importlib import import_module
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
+from telegram.helpers import escape_markdown
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -36,6 +37,15 @@ from src.database.user_data_manager import (
     set_user_offers_per_cycle,
     get_user_buffer_clear_days,
     set_user_buffer_clear_days,
+    get_user_category_scrolls,
+    set_user_category_scrolls,
+    get_user_category_pages,
+    set_user_category_pages,
+    get_user_telegram_source_channels,
+    add_user_telegram_source_channel,
+    remove_user_telegram_source_channel,
+    get_user_telegram_source_limit,
+    set_user_telegram_source_limit,
 )
 
 from src.utils.instagram_integration import (
@@ -90,12 +100,20 @@ CATEGORIES = [
     ("Offerte Amazon 💥", "cat_deals"),
     ("Offerte del giorno 🆕", "cat_goldbox"),
     ("Offerte lampo ⚡️", "cat_all"),
+    ("Fonti Telegram 📥", "cat_telegram_sources"),
 ]
 
-INFO_BUTTON = ("ℹ️ Informazioni", "info")
+INFO_BUTTON = ("ℹ️ Info", "info")
 SETTINGS_BUTTON = ("⚙️ Impostazioni", "settings")
 CATEGORY_BUTTON = ("📂 Categorie", "show_categories")
 FUNCTIONS_BUTTON = ("🛠️ Funzioni", "funzioni_menu")
+REFRESH_BUTTON = ("🔄 Aggiorna", "back_to_menu")
+
+CATEGORY_LABELS = {code: label for label, code in CATEGORIES}
+
+# Scansioni manuali Fonti Telegram in background.
+# Serve per non bloccare la dashboard mentre Telethon/PA-API/Selenium lavorano.
+_ACTIVE_TELEGRAM_SOURCE_SCANS: set[int] = set()
 
 
 # -----------------------------------------------------------------------------
@@ -136,38 +154,239 @@ async def require_admin(update: Update) -> bool:
 
 def build_main_menu(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(CATEGORY_BUTTON[0], callback_data=CATEGORY_BUTTON[1])],
-        [InlineKeyboardButton(SETTINGS_BUTTON[0], callback_data=SETTINGS_BUTTON[1])],
-        [InlineKeyboardButton(FUNCTIONS_BUTTON[0], callback_data=FUNCTIONS_BUTTON[1])],
-        [InlineKeyboardButton(INFO_BUTTON[0], callback_data=INFO_BUTTON[1])],
+        [
+            InlineKeyboardButton(CATEGORY_BUTTON[0], callback_data=CATEGORY_BUTTON[1]),
+            InlineKeyboardButton(SETTINGS_BUTTON[0], callback_data=SETTINGS_BUTTON[1]),
+        ],
+        [
+            InlineKeyboardButton("🧺 Buffer", callback_data="buffer_dashboard"),
+            InlineKeyboardButton(FUNCTIONS_BUTTON[0], callback_data=FUNCTIONS_BUTTON[1]),
+        ],
+        [
+            InlineKeyboardButton(INFO_BUTTON[0], callback_data=INFO_BUTTON[1]),
+            InlineKeyboardButton(REFRESH_BUTTON[0], callback_data=REFRESH_BUTTON[1]),
+        ],
     ])
 
 
 def build_connect_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📣 Canali / Gruppi Telegram", callback_data="connect_telegram")],
-        [InlineKeyboardButton("📘 Account Facebook", callback_data="connect_facebook")],
-        [InlineKeyboardButton("📷 Account Instagram", callback_data="connect_instagram")],
-        [InlineKeyboardButton("🔙 Torna alle Impostazioni", callback_data="settings")],
+        [InlineKeyboardButton("📣 Telegram", callback_data="connect_telegram")],
+        [InlineKeyboardButton("📘 Facebook", callback_data="connect_facebook")],
+        [InlineKeyboardButton("📷 Instagram", callback_data="connect_instagram")],
+        [InlineKeyboardButton("🔙 Impostazioni", callback_data="settings")],
     ])
 
 
 def build_settings_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔽 Filtri di Sconto", callback_data="filters")],
-        [InlineKeyboardButton("⏱️ Tempi", callback_data="timing_menu")],
-        [InlineKeyboardButton("🔗 Collega Canali", callback_data="connect_menu")],
-        [InlineKeyboardButton("🎟️ Licenza & Affiliazione", callback_data="license_menu")],
-        [InlineKeyboardButton("🔙 Torna al Menu", callback_data="back_to_menu")],
+        [
+            InlineKeyboardButton("🔽 Filtri", callback_data="filters"),
+            InlineKeyboardButton("⏱️ Tempi", callback_data="timing_menu"),
+        ],
+        [
+            InlineKeyboardButton("🔗 Canali", callback_data="connect_menu"),
+            InlineKeyboardButton("🎟️ Licenza", callback_data="license_menu"),
+        ],
+        [InlineKeyboardButton("🔃 Scroll categorie", callback_data="category_scrolls_menu")],
+        [InlineKeyboardButton("📄 Pagine categorie", callback_data="category_pages_menu")],
+        [InlineKeyboardButton("🔙 Dashboard", callback_data="back_to_menu")],
     ])
+
+
+def build_admin_license_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ 30 giorni", callback_data="admin_license_days_30"),
+            InlineKeyboardButton("✅ 90 giorni", callback_data="admin_license_days_90"),
+        ],
+        [
+            InlineKeyboardButton("✅ 180 giorni", callback_data="admin_license_days_180"),
+            InlineKeyboardButton("✅ 365 giorni", callback_data="admin_license_days_365"),
+        ],
+        [InlineKeyboardButton("✏️ Durata manuale", callback_data="admin_license_custom_days")],
+        [InlineKeyboardButton("📋 Utenti registrati", callback_data="admin_license_users")],
+        [InlineKeyboardButton("🔙 Torna a Licenza", callback_data="license_menu")],
+    ])
+
+
+def build_admin_license_text() -> str:
+    return (
+        "👑 *Gestione Licenze Admin*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Da qui puoi attivare o rinnovare una licenza senza usare comandi manuali.\n\n"
+        "1️⃣ Scegli la durata\n"
+        "2️⃣ Invia il Telegram ID dell’utente\n"
+        "3️⃣ Il bot salva automaticamente la nuova scadenza\n\n"
+        "Puoi usare anche il comando:\n"
+        "`/attivalicenza <user_id> <giorni>`"
+    )
 
 
 def build_functions_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔗 Link Manuale", callback_data="manual_link")],
-        [InlineKeyboardButton("🔙 Torna al Menu", callback_data="back_to_menu")],
+        [InlineKeyboardButton("🔗 Pubblica da link Amazon", callback_data="manual_link")],
+        [InlineKeyboardButton("📥 Fonti Telegram", callback_data="telegram_sources_menu")],
+        [InlineKeyboardButton("🔙 Dashboard", callback_data="back_to_menu")],
     ])
 
+
+
+
+def build_telegram_sources_menu(user_id: int) -> InlineKeyboardMarkup:
+    sources = get_user_telegram_source_channels(user_id)
+    keyboard = [
+        [InlineKeyboardButton("➕ Aggiungi canale sorgente", callback_data="telegram_source_add")],
+        [InlineKeyboardButton("🔍 Scansiona ora", callback_data="telegram_source_scan_all")],
+        [InlineKeyboardButton("⚙️ Limite lettura", callback_data="telegram_source_limit_menu")],
+        [InlineKeyboardButton("📘 Guida funzione", callback_data="telegram_source_guide")],
+    ]
+    for ch in sources[:10]:
+        clean = ch.lstrip("@")
+        keyboard.append([InlineKeyboardButton(f"❌ Rimuovi {ch}", callback_data=f"telegram_source_remove_{clean}")])
+    keyboard.append([InlineKeyboardButton("🔙 Funzioni", callback_data="funzioni_menu")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_telegram_source_limit_menu(user_id: int) -> InlineKeyboardMarkup:
+    current = get_user_telegram_source_limit(user_id)
+    options = [10, 20, 30, 50, 75, 100, 150, 200]
+    rows = []
+    row = []
+    for value in options:
+        label = f"✅ {value}" if value == current else str(value)
+        row.append(InlineKeyboardButton(label, callback_data=f"telegram_source_limit_{value}"))
+        if len(row) == 4:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("📘 Guida limite", callback_data="telegram_source_limit_guide")])
+    rows.append([InlineKeyboardButton("🔙 Fonti Telegram", callback_data="telegram_sources_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_telegram_source_limit_text(user_id: int) -> str:
+    current = get_user_telegram_source_limit(user_id)
+    return (
+        "⚙️ *Limite lettura Fonti Telegram*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"Valore attuale: *{current} messaggi per fonte*\n\n"
+        "Questo valore indica quanti messaggi recenti leggere da ogni canale sorgente.\n\n"
+        "📌 *Consiglio pratico*\n"
+        "• 10-30 = leggero e veloce\n"
+        "• 50 = consigliato per uso normale\n"
+        "• 75-100 = scansione più profonda\n"
+        "• 150-200 = pesante, utile solo se il canale pubblica molto\n\n"
+        "Più aumenti il limite, più offerte puoi trovare, ma la scansione sarà più lenta."
+    )
+
+
+def build_telegram_source_limit_guide_text() -> str:
+    return (
+        "📘 *Guida limite lettura Telegram*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Il limite non significa ‘numero offerte da importare’.\n"
+        "Significa quanti messaggi il bot legge dal canale.\n\n"
+        "Esempio:\n"
+        "• Limite 30 = legge gli ultimi 30 messaggi\n"
+        "• Se solo 1 messaggio contiene link Amazon, importa 1 candidato\n\n"
+        "🔍 *Perché può trovare poche offerte?*\n"
+        "• post senza link Amazon\n"
+        "• link dentro redirect strani\n"
+        "• ASIN già importati o pubblicati\n"
+        "• prodotti senza prezzo valido\n"
+        "• post duplicati dello stesso prodotto\n\n"
+        "🚀 *Impostazione consigliata*\n"
+        "Usa 50 per l’automatico. Usa 100/150 solo per scansioni manuali più profonde."
+    )
+
+
+
+def _format_source_stat_time(ts: object) -> str:
+    try:
+        from datetime import datetime
+        value = int(ts or 0)
+        if value <= 0:
+            return "mai"
+        return datetime.fromtimestamp(value).strftime("%d/%m %H:%M")
+    except Exception:
+        return "mai"
+
+
+def _telegram_sources_stats_lines(user_id: int) -> str:
+    sources = get_user_telegram_source_channels(user_id)
+    if not sources:
+        return "Nessun canale sorgente configurato."
+
+    try:
+        from src.telegram_sources.source_store import get_source_stats
+        stats_map = get_source_stats(user_id)
+    except Exception:
+        stats_map = {}
+
+    lines = []
+    for ch in sources:
+        stat = stats_map.get(ch, {}) if isinstance(stats_map, dict) else {}
+        if not stat:
+            lines.append(f"• `{ch}` → mai scansionato")
+            continue
+        links = int(stat.get("found_links", 0) or 0)
+        asins = int(stat.get("found_asins", 0) or 0)
+        added = int(stat.get("added_products", 0) or 0)
+        skipped = int(stat.get("skipped_invalid", 0) or 0)
+        errors = int(stat.get("errors", 0) or 0)
+        when = _format_source_stat_time(stat.get("updated_at"))
+        lines.append(
+            f"• `{ch}` → 🔗 {links} | ASIN {asins} | ✅ {added} | 🗑️ {skipped} | ⚠️ {errors} | {when}"
+        )
+    return "\n".join(lines)
+
+def build_telegram_sources_text(user_id: int) -> str:
+    limit = get_user_telegram_source_limit(user_id)
+    lines = _telegram_sources_stats_lines(user_id)
+    return (
+        "📥 *Fonti Telegram*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Da qui puoi inserire canali Telegram pubblici da cui prelevare segnalazioni offerte.\n\n"
+        "Il bot legge gli ultimi post del canale, cerca link Amazon, recupera l’ASIN e ricostruisce l’offerta con i tuoi dati e i tuoi filtri.\n\n"
+        f"📌 Messaggi letti per canale: *{limit}*\n"
+        f"📦 Buffer destinazione: *Fonti Telegram*\n\n"
+        "📊 *Statistiche ultima scansione*\n"
+        "Legenda: 🔗 link trovati | ASIN recuperati | ✅ aggiunti | 🗑️ scartati | ⚠️ errori | ultimo controllo\n"
+        f"{lines}\n\n"
+        "Nota: funziona con canali pubblici leggibili da `t.me/s/nomecanale`, oppure con Telethon se abilitato."
+    )
+
+
+def build_telegram_sources_guide_text() -> str:
+    return (
+        "📘 *Guida Fonti Telegram*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Questa funzione usa Telegram come fonte di segnalazione offerte.\n\n"
+        "✅ *Modalità base*\n"
+        "• Inserisci un canale pubblico, esempio `@nomecanale`\n"
+        "• Il bot legge la preview pubblica `t.me/s/nomecanale`\n"
+        "• Estrae link Amazon, ASIN, prezzo e foto quando disponibili\n\n"
+        "🚀 *Modalità avanzata Telethon*\n"
+        "Se nel `.env` abiliti `TELETHON_ENABLED=true`, il bot usa un account Telegram reale.\n"
+        "Così può leggere meglio:\n"
+        "• bottoni inline con link nascosti\n"
+        "• foto reali dei post\n"
+        "• canali/gruppi dove l’account è membro\n"
+        "• messaggi ricevuti da altri bot, se l’account ha quella chat\n\n"
+        "🔐 *Prima configurazione Telethon*\n"
+        "1. Vai su `my.telegram.org`\n"
+        "2. Crea una app e copia `API_ID` e `API_HASH`\n"
+        "3. Mettili nel `.env`\n"
+        "4. Esegui `python telethon_login.py`\n"
+        "5. Imposta `TELETHON_ENABLED=true` e riavvia\n\n"
+        "🛡️ *Importante*\n"
+        "Il bot non copia il testo originale degli altri canali. Usa link/ASIN/prezzo/foto come segnale e ricrea il post con il tuo formato, il tuo tag affiliato e i tuoi filtri.\n\n"
+        "📊 *Statistiche*\n"
+        "Nel menu Fonti Telegram vedi, per ogni canale, quanti link/ASIN sono stati trovati, quante offerte sono entrate nel buffer e quante sono state scartate.\n\n"
+        "📦 Buffer usato: *Fonti Telegram 📥*"
+    )
 
 def build_category_keyboard(user_id: int, columns: int = 2) -> InlineKeyboardMarkup:
     selected = get_user_categories(user_id)
@@ -199,19 +418,298 @@ def build_timing_menu() -> InlineKeyboardMarkup:
     ])
 
 
-def build_welcome_text(first_name: str) -> str:
+def build_category_scrolls_menu(user_id: int) -> InlineKeyboardMarkup:
+    current = get_user_category_scrolls(user_id)
+    values = [3, 5, 8, 10, 12, 15, 20, 25, 30]
+    keyboard = []
+    row = []
+
+    for value in values:
+        label = f"{value} scroll"
+        if value == current:
+            label = f"✅ {label}"
+        row.append(InlineKeyboardButton(label, callback_data=f"category_scrolls_{value}"))
+        if len(row) == 3:
+            keyboard.append(row)
+            row = []
+
+    if row:
+        keyboard.append(row)
+
+    keyboard.append([InlineKeyboardButton("📘 Guida scroll", callback_data="category_scrolls_guide")])
+    keyboard.append([InlineKeyboardButton("🔙 Torna alle Impostazioni", callback_data="settings")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_category_scrolls_text(user_id: int) -> str:
+    current = get_user_category_scrolls(user_id)
     return (
-        f"👋 Ciao *{first_name}*!\n\n"
-        "🛍️ *Benvenuto nel Bot Offerte Amazon*\n\n"
-        "Con questo bot puoi:\n"
-        "• scegliere le categorie da monitorare\n"
-        "• impostare lo sconto minimo\n"
-        "• pubblicare offerte nei tuoi canali o social\n"
-        "• usare funzioni manuali per post veloci\n\n"
-        "👨‍💻 Bot creato da @Gianluca85\n\n"
-        "👇 Seleziona un’opzione dal menu:"
+        "🔃 *Scroll categorie*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Da qui imposti quanti scroll deve fare Selenium quando scansiona le pagine categoria Amazon.\n\n"
+        f"📌 Valore attuale: *{current} scroll*\n\n"
+        "Questo valore viene usato da tutte le categorie in modo uniforme, così non hai più categorie con scroll diversi scritti nei singoli file.\n\n"
+        "Consiglio pratico:\n"
+        "• *3-5* = test veloce\n"
+        "• *8-12* = uso normale consigliato\n"
+        "• *15-30* = scansione profonda, più lenta e più pesante\n\n"
+        "Dopo aver cambiato il valore, il prossimo refill userà la nuova impostazione."
     )
 
+
+def build_category_scrolls_guide_text(user_id: int) -> str:
+    current = get_user_category_scrolls(user_id)
+    return (
+        "📘 *Guida Scroll Categorie*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"Valore attuale: *{current} scroll*\n\n"
+        "🔍 *Cosa sono gli scroll?*\n"
+        "Quando il bot apre una pagina Amazon, molti prodotti vengono caricati solo scorrendo la pagina. "
+        "Più scroll significa più prodotti trovati, ma anche scansioni più lente.\n\n"
+        "⚡ *Quando usare pochi scroll*\n"
+        "Usa 3-5 scroll se stai testando il bot, se il PC è sotto carico o se vuoi refill più rapidi.\n\n"
+        "✅ *Valore consigliato*\n"
+        "Per uso normale usa 8-12 scroll. È il compromesso migliore tra velocità e quantità di prodotti.\n\n"
+        "🧲 *Quando usare tanti scroll*\n"
+        "Usa 15-30 scroll solo se vuoi riempire meglio i buffer e puoi aspettare di più. "
+        "Valori alti possono aumentare blocchi, CAPTCHA o lentezza di Selenium.\n\n"
+        "📌 *Nota importante*\n"
+        "Questa impostazione non pubblica più offerte da sola: decide solo quanto in profondità cercare i prodotti durante il refill."
+    )
+
+
+def build_category_pages_menu(user_id: int) -> InlineKeyboardMarkup:
+    current = get_user_category_pages(user_id)
+    values = [1, 2, 3, 4, 5, 7, 10]
+    keyboard = []
+    row = []
+
+    for value in values:
+        label = f"{value} pagina" if value == 1 else f"{value} pagine"
+        if value == current:
+            label = f"✅ {label}"
+        row.append(InlineKeyboardButton(label, callback_data=f"category_pages_{value}"))
+        if len(row) == 3:
+            keyboard.append(row)
+            row = []
+
+    if row:
+        keyboard.append(row)
+
+    keyboard.append([InlineKeyboardButton("📘 Guida pagine", callback_data="category_pages_guide")])
+    keyboard.append([InlineKeyboardButton("🔙 Torna alle Impostazioni", callback_data="settings")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_category_pages_text(user_id: int) -> str:
+    current = get_user_category_pages(user_id)
+    scrolls = get_user_category_scrolls(user_id)
+    return (
+        "📄 *Pagine categorie*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Da qui imposti quante pagine Amazon deve aprire per ogni categoria durante il refill.\n\n"
+        f"📌 Valore attuale: *{current} pagine*\n"
+        f"🔃 Scroll per pagina: *{scrolls}*\n\n"
+        "Prima il bot scorre la pagina corrente, poi prova a cliccare/aprire *pagina successiva*. "
+        "Questo aiuta quando Amazon non carica più prodotti con il solo scroll.\n\n"
+        "Consiglio pratico:\n"
+        "• *1 pagina* = test veloce\n"
+        "• *2-3 pagine* = uso normale consigliato\n"
+        "• *4-5 pagine* = più offerte, più lento\n"
+        "• *7-10 pagine* = scansione profonda, rischio CAPTCHA più alto\n\n"
+        "Dopo aver cambiato il valore, cancello i buffer attivi così il prossimo refill userà subito la nuova profondità."
+    )
+
+
+def build_category_pages_guide_text(user_id: int) -> str:
+    current = get_user_category_pages(user_id)
+    scrolls = get_user_category_scrolls(user_id)
+    return (
+        "📘 *Guida Pagine Categorie*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"Valore attuale: *{current} pagine*\n"
+        f"Scroll per pagina: *{scrolls}*\n\n"
+        "🔍 *Perché serve?*\n"
+        "Su alcune categorie Amazon lo scroll non basta: dopo aver caricato tutta la prima pagina, bisogna passare alla pagina successiva per trovare altre offerte.\n\n"
+        "✅ *Impostazione consigliata*\n"
+        "Usa *2 o 3 pagine* per avere più candidati senza appesantire troppo Chrome/Selenium.\n\n"
+        "⚠️ *Attenzione*\n"
+        "Più pagine significano più tempo, più richieste ad Amazon e più rischio CAPTCHA. "
+        "Se noti rallentamenti o blocchi, torna a 2 pagine e abbassa gli scroll.\n\n"
+        "📌 *Formula pratica*\n"
+        "Lavoro totale ≈ pagine categorie × scroll categorie.\n"
+        "Esempio: 3 pagine × 8 scroll = 24 passaggi di scansione per categoria."
+    )
+
+
+def _count_buffer_for_category(user_id: int, category_code: str) -> int:
+    try:
+        from src.buffer.buffer_manager import count_products_in_buffer
+        return int(count_products_in_buffer(user_id, category_code))
+    except Exception:
+        return 0
+
+
+def _count_all_buffers(user_id: int, categories: list[str]) -> tuple[int, dict[str, int]]:
+    per_category: dict[str, int] = {}
+    total = 0
+    for code in categories:
+        count = _count_buffer_for_category(user_id, code)
+        per_category[code] = count
+        total += count
+    return total, per_category
+
+
+def _short_category_label(category_code: str) -> str:
+    label = CATEGORY_LABELS.get(category_code, category_code)
+    return label.replace("✅ ", "").strip()
+
+
+def _format_license_status(user_info: dict) -> str:
+    if license_is_valid(user_info):
+        return f"✅ attiva fino al {user_info.get('license_expires', '?')}"
+    if user_info.get("has_license"):
+        return "⚠️ scaduta"
+    return "❌ non attiva"
+
+
+def build_welcome_text(first_name: str, user_id: int | None = None) -> str:
+    now = datetime.now().strftime("%H:%M")
+    safe_first_name = escape_markdown(first_name or "Admin", version=1)
+
+    active_categories: list[str] = []
+    user_info: dict = {}
+    total_buffer = 0
+    channels_count = 0
+    min_discount = 20
+    post_interval = 15
+    offers_per_cycle = 1
+    days_delay = 2
+    buffer_clear_days = 0
+    license_status = "❌ non attiva"
+
+    if user_id is not None:
+        try:
+            active_categories = get_user_categories(user_id)
+            user_info = get_user_info(user_id)
+            total_buffer, _ = _count_all_buffers(user_id, active_categories)
+            channels_count = len(user_info.get("telegram_channels", []) or [])
+            min_discount = get_user_min_discount(user_id)
+            post_interval = get_user_post_interval(user_id)
+            offers_per_cycle = get_user_offers_per_cycle(user_id)
+            days_delay = get_user_days_limit(user_id)
+            buffer_clear_days = get_user_buffer_clear_days(user_id)
+            license_status = _format_license_status(user_info)
+        except Exception:
+            logger.exception("[DASHBOARD] Errore costruzione dashboard")
+
+    categories_preview = "nessuna"
+    if active_categories:
+        labels = [_short_category_label(code) for code in active_categories[:4]]
+        categories_preview = ", ".join(labels)
+        if len(active_categories) > 4:
+            categories_preview += f" +{len(active_categories) - 4}"
+
+    channel_status = f"{channels_count} collegati" if channels_count else "nessun canale"
+    clear_status = f"ogni {buffer_clear_days} giorni" if buffer_clear_days else "manuale"
+
+    return (
+        "🛒 *AMAZON OFFERS BOT*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"👋 Ciao *{safe_first_name}*\n"
+        f"🟢 Stato: *pronto*\n"
+        f"🕒 Aggiornato: *{now}*\n\n"
+        "📊 *Panoramica*\n"
+        f"• Categorie attive: *{len(active_categories)}*\n"
+        f"• Prodotti in buffer: *{total_buffer}*\n"
+        f"• Canali: *{channel_status}*\n"
+        f"• Licenza: *{license_status}*\n\n"
+        "⚙️ *Configurazione*\n"
+        f"• Offerte per categoria: *{offers_per_cycle}*\n"
+        f"• Intervallo post: *{post_interval} min*\n"
+        f"• Sconto minimo: *{min_discount}%*\n"
+        f"• Ripubblicazione: *dopo {days_delay} giorni*\n"
+        f"• Pulizia buffer: *{clear_status}*\n\n"
+        "📦 *Categorie*\n"
+        f"• {categories_preview}\n\n"
+        "👇 Usa i pulsanti qui sotto per gestire il bot."
+    )
+
+
+def build_category_text(user_id: int) -> str:
+    selected = get_user_categories(user_id)
+    total_buffer, per_category = _count_all_buffers(user_id, selected)
+
+    if selected:
+        selected_lines = []
+        for code in selected:
+            selected_lines.append(f"• {_short_category_label(code)}: *{per_category.get(code, 0)}* offerte")
+        selected_text = "\n".join(selected_lines)
+    else:
+        selected_text = "• Nessuna categoria attiva"
+
+    return (
+        "📂 *Categorie monitorate*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Seleziona o rimuovi le categorie da monitorare.\n\n"
+        f"✅ Attive: *{len(selected)}*\n"
+        f"🧺 Buffer totale: *{total_buffer}* offerte\n\n"
+        f"{selected_text}\n\n"
+        "Tocca una categoria per attivarla o disattivarla."
+    )
+
+
+def build_settings_text(user_id: int) -> str:
+    user_info = get_user_info(user_id)
+    channels_count = len(user_info.get("telegram_channels", []) or [])
+    return (
+        "⚙️ *Impostazioni*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Gestisci pubblicazione, canali e affiliazione.\n\n"
+        f"🔽 Sconto minimo: *{get_user_min_discount(user_id)}%*\n"
+        f"⏱️ Intervallo: *{get_user_post_interval(user_id)} min*\n"
+        f"🔢 Offerte per categoria: *{get_user_offers_per_cycle(user_id)}*\n"
+        f"🔃 Scroll categorie: *{get_user_category_scrolls(user_id)}*\n"
+        f"📄 Pagine categorie: *{get_user_category_pages(user_id)}*\n"
+        f"📣 Canali collegati: *{channels_count}*\n"
+        f"🎟️ Licenza: *{_format_license_status(user_info)}*\n\n"
+        "Scegli una sezione da configurare."
+    )
+
+
+def build_functions_text() -> str:
+    return (
+        "🛠️ *Funzioni rapide*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Strumenti manuali per lavorare più velocemente.\n\n"
+        "🔗 *Pubblica da link Amazon*\n"
+        "Incolla un link prodotto e il bot prepara post, immagine e pulsante.\n\n"
+        "Seleziona una funzione."
+    )
+
+
+def build_buffer_dashboard_text(user_id: int) -> str:
+    selected = get_user_categories(user_id)
+    total_buffer, per_category = _count_all_buffers(user_id, selected)
+
+    if selected:
+        lines = []
+        for code in selected:
+            count = per_category.get(code, 0)
+            status = "🟢" if count >= 10 else "🟡" if count > 0 else "🔴"
+            lines.append(f"{status} {_short_category_label(code)}: *{count}*")
+        body = "\n".join(lines)
+    else:
+        body = "Nessuna categoria attiva."
+
+    return (
+        "🧺 *Stato Buffer*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"📦 Totale offerte pronte: *{total_buffer}*\n"
+        f"📂 Categorie attive: *{len(selected)}*\n\n"
+        f"{body}\n\n"
+        "Legenda: 🟢 ok · 🟡 basso · 🔴 vuoto"
+    )
 
 def clear_all_waiting_flags(context: ContextTypes.DEFAULT_TYPE):
     keys_to_remove = [
@@ -225,6 +723,10 @@ def clear_all_waiting_flags(context: ContextTypes.DEFAULT_TYPE):
         "awaiting_end_time",
         "awaiting_channel_username",
         "awaiting_channel_removal",
+        "awaiting_admin_license_user_id",
+        "awaiting_admin_license_custom_days",
+        "admin_license_days",
+        "admin_license_prompt_msg_id",
     ]
     for key in keys_to_remove:
         context.user_data.pop(key, None)
@@ -335,6 +837,63 @@ async def async_refill_and_notify(user_id: int, category_code: str):
     }
 
     try:
+        # La categoria Fonti Telegram non ha uno scraper Amazon tradizionale.
+        # Va riempita scansionando i canali salvati in telegram_sources.json / user_data.json.
+        if category_code == "cat_telegram_sources":
+            from src.telegram_sources.importer import import_channel_offers_to_buffer
+
+            sources = get_user_telegram_source_channels(user_id)
+            if not sources:
+                logger.info(
+                    "[REFILL] Fonti Telegram: nessuna fonte configurata per user=%s",
+                    user_id,
+                )
+                return
+
+            limit = get_user_telegram_source_limit(user_id)
+            total_links = 0
+            total_asins = 0
+            total_added = 0
+            total_errors = 0
+
+            logger.info(
+                "[REFILL] Fonti Telegram: scansiono %s fonti per user=%s limit=%s",
+                len(sources),
+                user_id,
+                limit,
+            )
+
+            for source in sources:
+                result = await asyncio.to_thread(
+                    import_channel_offers_to_buffer,
+                    user_id,
+                    source,
+                    limit,
+                )
+                total_links += getattr(result, "found_links", 0)
+                total_asins += getattr(result, "found_asins", 0)
+                total_added += getattr(result, "added_products", 0)
+                total_errors += getattr(result, "errors", 0)
+
+            logger.info(
+                "[REFILL] Fonti Telegram completate per user=%s | fonti=%s link=%s asin=%s aggiunti=%s errori=%s",
+                user_id,
+                len(sources),
+                total_links,
+                total_asins,
+                total_added,
+                total_errors,
+            )
+            return
+
+        if category_code not in scrapers:
+            logger.warning(
+                "[REFILL] Categoria non gestita: user=%s category=%s",
+                user_id,
+                category_code,
+            )
+            return
+
         mod_path, func_name = scrapers[category_code]
         scraper_module = import_module(mod_path)
         scraper_func = getattr(scraper_module, func_name)
@@ -360,7 +919,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_all_waiting_flags(context)
 
     await update.message.reply_text(
-        build_welcome_text(user.first_name),
+        build_welcome_text(user.first_name, user.id),
         reply_markup=build_main_menu(user.id),
         parse_mode=ParseMode.MARKDOWN
     )
@@ -385,6 +944,167 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
         except Exception:
             logger.exception("[INSTAGRAM] Errore nella gestione token Instagram")
+
+    # -------------------------------------------------------------------------
+    # ADMIN: ATTIVAZIONE LICENZA DA PANNELLO
+    # -------------------------------------------------------------------------
+    if context.user_data.get("awaiting_admin_license_custom_days"):
+        if not is_admin(user_id):
+            context.user_data.pop("awaiting_admin_license_custom_days", None)
+            await update.message.reply_text("🚫 Operazione riservata all’amministratore.")
+            return
+
+        try:
+            days = int(text.strip())
+            if days <= 0 or days > 3650:
+                raise ValueError
+        except Exception:
+            await update.message.reply_text("❌ Durata non valida. Invia un numero di giorni, esempio: `30`", parse_mode=ParseMode.MARKDOWN)
+            return
+
+        context.user_data["awaiting_admin_license_custom_days"] = False
+        context.user_data["awaiting_admin_license_user_id"] = True
+        context.user_data["admin_license_days"] = days
+
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+        prompt_id = context.user_data.get("admin_license_prompt_msg_id")
+        text_msg = (
+            "👑 *Gestione Licenze Admin*\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"✅ Durata scelta: *{days} giorni*\n\n"
+            "Ora inviami il *Telegram ID* dell’utente da attivare.\n\n"
+            "Esempio: `1271567510`"
+        )
+        if prompt_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=prompt_id,
+                    text=text_msg,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Annulla", callback_data="admin_license_menu")]])
+                )
+            except Exception:
+                await context.bot.send_message(chat_id=chat_id, text=text_msg, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=text_msg, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if context.user_data.get("awaiting_admin_license_user_id"):
+        from src.utils.license_manager import attiva_licenza
+
+        if not is_admin(user_id):
+            context.user_data.pop("awaiting_admin_license_user_id", None)
+            await update.message.reply_text("🚫 Operazione riservata all’amministratore.")
+            return
+
+        days = int(context.user_data.get("admin_license_days", 30))
+        try:
+            target_user_id = int(text.strip())
+        except Exception:
+            await update.message.reply_text("❌ Telegram ID non valido. Invia solo numeri, esempio: `1271567510`", parse_mode=ParseMode.MARKDOWN)
+            return
+
+        try:
+            attiva_licenza(target_user_id, days)
+            data = load_user_data()
+            exp = data.get(str(target_user_id), {}).get("license_expires", "?")
+            notified = await notify_user_license_activated(context.bot, target_user_id, days, exp)
+
+            context.user_data.pop("awaiting_admin_license_user_id", None)
+            context.user_data.pop("admin_license_days", None)
+
+            try:
+                await update.message.delete()
+            except Exception:
+                pass
+
+            result_text = (
+                "✅ *Licenza attivata*\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"👤 Utente: `{target_user_id}`\n"
+                f"⏳ Durata: *{days} giorni*\n"
+                f"📅 Scadenza: *{exp}*\n"
+                f"📩 Notifica utente: *{'inviata' if notified else 'non inviata'}*\n\n"
+                "Puoi attivare un’altra licenza oppure tornare al pannello."
+            )
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Attiva altra licenza", callback_data="admin_license_menu")],
+                [InlineKeyboardButton("🔙 Licenza & Affiliazione", callback_data="license_menu")],
+            ])
+
+            prompt_id = context.user_data.get("admin_license_prompt_msg_id")
+            if prompt_id:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=prompt_id,
+                        text=result_text,
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=keyboard
+                    )
+                except Exception:
+                    await context.bot.send_message(chat_id=chat_id, text=result_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=result_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+
+        except Exception as e:
+            logger.exception("[ADMIN_LICENSE] Errore attivazione da pannello")
+            await update.message.reply_text(f"⚠️ Errore attivazione licenza: `{e}`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # -------------------------------------------------------------------------
+    # FONTI TELEGRAM: AGGIUNGI CANALE SORGENTE
+    # -------------------------------------------------------------------------
+    if context.user_data.get("awaiting_telegram_source_channel"):
+        from src.telegram_sources.importer import normalize_channel_name
+
+        clean = normalize_channel_name(text)
+        if not clean:
+            await update.message.reply_text(
+                "❌ Canale non valido. Inviami un canale pubblico, esempio: `@nomecanale` oppure `https://t.me/nomecanale`.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+
+        try:
+            add_user_telegram_source_channel(user_id, clean)
+            context.user_data["awaiting_telegram_source_channel"] = False
+            try:
+                await update.message.delete()
+            except Exception:
+                pass
+
+            msg_text = (
+                "✅ *Fonte Telegram aggiunta*\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"Canale: `{clean}`\n\n"
+                "Ho attivato automaticamente anche la categoria *Fonti Telegram 📥*.\n"
+                "Ora puoi premere *Scansiona ora* per importare le offerte nel buffer."
+            )
+            keyboard = build_telegram_sources_menu(user_id)
+            prompt_id = context.user_data.get("telegram_source_prompt_msg_id")
+            if prompt_id:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=prompt_id,
+                        text=msg_text,
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=keyboard
+                    )
+                except Exception:
+                    await context.bot.send_message(chat_id=chat_id, text=msg_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=msg_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+        except Exception as exc:
+            logger.exception("[TG-SOURCES] Errore salvataggio canale sorgente")
+            await update.message.reply_text(f"⚠️ Errore salvataggio fonte: `{exc}`", parse_mode=ParseMode.MARKDOWN)
+        return
 
     # -------------------------------------------------------------------------
     # LINK MANUALE
@@ -907,7 +1627,17 @@ async def attivalicenza_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         giorni = int(context.args[1])
 
         attiva_licenza(user_id, giorni)
-        await update.message.reply_text(f"✅ Licenza attivata per `{user_id}` per `{giorni}` giorni.", parse_mode=ParseMode.MARKDOWN)
+        data = load_user_data()
+        exp = data.get(str(user_id), {}).get("license_expires", "?")
+        notified = await notify_user_license_activated(context.bot, user_id, giorni, exp)
+        await update.message.reply_text(
+            (
+                f"✅ Licenza attivata per `{user_id}` per `{giorni}` giorni.\n"
+                f"📅 Scadenza: *{exp}*\n"
+                f"📩 Notifica utente: *{'inviata' if notified else 'non inviata'}*"
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
     except Exception as e:
         logger.exception("[LICENZA] Errore attivazione")
@@ -987,6 +1717,82 @@ async def track_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 # -----------------------------------------------------------------------------
 # CALLBACK PRINCIPALI
 # -----------------------------------------------------------------------------
+
+
+async def run_telegram_sources_scan_background(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    chat_id: int,
+    message_id: int,
+    sources: list[str],
+    limit: int,
+) -> None:
+    """Esegue la scansione Fonti Telegram fuori dal callback handler.
+
+    In questo modo Telegram resta reattivo: l'admin può continuare a premere
+    pulsanti e usare la dashboard mentre l'import lavora in background.
+    """
+    from src.telegram_sources.importer import import_channel_offers_to_buffer
+
+    try:
+        results = []
+        for ch in sources:
+            logger.info("[TG-SOURCES][MANUAL-BG] Scansione background %s user=%s limit=%s", ch, user_id, limit)
+            res = await asyncio.to_thread(import_channel_offers_to_buffer, user_id, ch, limit)
+            results.append(res)
+
+        total_links = sum(r.found_links for r in results)
+        total_asins = sum(r.found_asins for r in results)
+        total_added = sum(r.added_products for r in results)
+        total_discarded = sum(getattr(r, "discarded_products", 0) for r in results)
+        total_errors = sum(r.errors for r in results)
+
+        detail_lines = []
+        for r in results:
+            extra = "" if not getattr(r, "message", "") or r.message == "ok" else f" — {r.message}"
+            detail_lines.append(
+                f"• `{r.channel}` → 🔗 {r.found_links} | ASIN {r.found_asins} | ✅ {r.added_products} | 🗑️ {getattr(r, 'discarded_products', 0)}{extra}"
+            )
+
+        result_text = (
+            "✅ *Scansione Fonti Telegram completata*\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"🔗 Link Amazon trovati: *{total_links}*\n"
+            f"🧩 ASIN recuperati: *{total_asins}*\n"
+            f"📦 Prodotti aggiunti al buffer: *{total_added}*\n"
+            f"🗑️ Scartati: *{total_discarded}*\n"
+            f"⚠️ Errori: *{total_errors}*\n\n"
+            "📋 *Dettaglio*\n"
+            + ("\n".join(detail_lines) if detail_lines else "Nessun dettaglio disponibile")
+            + "\n\nIl buffer usato è: *Fonti Telegram 📥*."
+        )
+
+    except Exception as exc:
+        logger.exception("[TG-SOURCES][MANUAL-BG] Errore scansione manuale background user=%s", user_id)
+        result_text = (
+            "❌ *Errore scansione Fonti Telegram*\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"Dettaglio: `{escape_markdown(str(exc), version=2)}`\n\n"
+            "Puoi riprovare tra qualche minuto."
+        )
+
+    finally:
+        _ACTIVE_TELEGRAM_SOURCE_SCANS.discard(user_id)
+
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=result_text,
+            reply_markup=build_telegram_sources_menu(user_id),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except BadRequest as exc:
+        logger.warning("[TG-SOURCES][MANUAL-BG] Impossibile aggiornare messaggio dashboard: %s", exc)
+    except Exception:
+        logger.exception("[TG-SOURCES][MANUAL-BG] Errore aggiornamento finale dashboard")
+
+
 async def category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
@@ -1005,13 +1811,16 @@ async def category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # INFO
     # -------------------------------------------------------------------------
     if data == "info":
-        keyboard = [[InlineKeyboardButton("🔙 Torna al Menu", callback_data="back_to_menu")]]
+        keyboard = [[InlineKeyboardButton("🔙 Dashboard", callback_data="back_to_menu")]]
         await query.edit_message_text(
-            "ℹ️ *Come funziona il bot*\n\n"
-            "• Seleziona le categorie che vuoi monitorare\n"
-            "• Imposta il filtro minimo di sconto\n"
-            "• Collega i tuoi canali o social\n"
-            "• Il bot pubblicherà le offerte in automatico secondo le tue impostazioni",
+            "ℹ️ *Informazioni*\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "Questo bot aiuta a monitorare offerte Amazon e pubblicarle su Telegram.\n\n"
+            "✅ Selezioni le categorie\n"
+            "✅ Imposti filtri e tempi\n"
+            "✅ Colleghi i tuoi canali\n"
+            "✅ Il bot prepara post puliti con link affiliato\n\n"
+            "Suggerimento: mantieni poche categorie attive e punta su offerte credibili.",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=ParseMode.MARKDOWN
         )
@@ -1022,7 +1831,7 @@ async def category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # -------------------------------------------------------------------------
     if data == "settings":
         await query.edit_message_text(
-            "⚙️ *Impostazioni utente*\n\nScegli cosa configurare:",
+            build_settings_text(user_id),
             reply_markup=build_settings_menu(),
             parse_mode=ParseMode.MARKDOWN
         )
@@ -1033,8 +1842,147 @@ async def category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # -------------------------------------------------------------------------
     if data == "funzioni_menu":
         await query.edit_message_text(
-            "🛠️ *Funzioni personalizzate*\n\nSeleziona un’operazione:",
+            build_functions_text(),
             reply_markup=build_functions_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    # -------------------------------------------------------------------------
+    # FONTI TELEGRAM
+    # -------------------------------------------------------------------------
+    if data == "telegram_sources_menu":
+        await query.edit_message_text(
+            build_telegram_sources_text(user_id),
+            reply_markup=build_telegram_sources_menu(user_id),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    if data == "telegram_source_guide":
+        await query.edit_message_text(
+            build_telegram_sources_guide_text(),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Fonti Telegram", callback_data="telegram_sources_menu")]]),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    if data == "telegram_source_limit_menu":
+        await query.edit_message_text(
+            build_telegram_source_limit_text(user_id),
+            reply_markup=build_telegram_source_limit_menu(user_id),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    if data == "telegram_source_limit_guide":
+        await query.edit_message_text(
+            build_telegram_source_limit_guide_text(),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Limite lettura", callback_data="telegram_source_limit_menu")]]),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    if data.startswith("telegram_source_limit_"):
+        try:
+            new_limit = int(data.rsplit("_", 1)[1])
+        except Exception:
+            new_limit = 30
+        set_user_telegram_source_limit(user_id, new_limit)
+        await query.edit_message_text(
+            "✅ *Limite lettura aggiornato*\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"Da ora il bot leggerà *{new_limit} messaggi* per ogni fonte Telegram.\n\n"
+            "La prossima scansione userà subito questo valore.",
+            reply_markup=build_telegram_source_limit_menu(user_id),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    if data == "telegram_source_add":
+        context.user_data["awaiting_telegram_source_channel"] = True
+        context.user_data["telegram_source_prompt_msg_id"] = query.message.message_id
+        await query.edit_message_text(
+            "➕ *Aggiungi fonte Telegram*\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "Inviami l’`@username` del canale pubblico da cui vuoi prelevare le offerte.\n\n"
+            "Esempi:\n"
+            "`@nomecanale`\n"
+            "`https://t.me/nomecanale`\n\n"
+            "Il bot leggerà la preview pubblica del canale e importerà solo link Amazon validi.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Annulla", callback_data="telegram_sources_menu")]])
+        )
+        return
+
+    if data.startswith("telegram_source_remove_"):
+        ch = "@" + data.split("telegram_source_remove_", 1)[1]
+        remove_user_telegram_source_channel(user_id, ch)
+        await query.edit_message_text(
+            f"🗑️ Fonte rimossa: `{ch}`\n\n" + build_telegram_sources_text(user_id),
+            reply_markup=build_telegram_sources_menu(user_id),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    if data == "telegram_source_scan_all":
+        sources = get_user_telegram_source_channels(user_id)
+        if not sources:
+            await query.edit_message_text(
+                "📥 *Fonti Telegram*\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "Non hai ancora configurato nessun canale sorgente.",
+                reply_markup=build_telegram_sources_menu(user_id),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+
+        if user_id in _ACTIVE_TELEGRAM_SOURCE_SCANS:
+            await query.edit_message_text(
+                "⏳ *Scansione già in corso*\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "Sto già leggendo le fonti Telegram configurate.\n\n"
+                "Puoi continuare a usare la dashboard: appena finisce aggiorno questo messaggio con il riepilogo.",
+                reply_markup=build_telegram_sources_menu(user_id),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+
+        limit = get_user_telegram_source_limit(user_id)
+        _ACTIVE_TELEGRAM_SOURCE_SCANS.add(user_id)
+
+        await query.edit_message_text(
+            "⏳ *Scansione fonti Telegram avviata*\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"📡 Fonti configurate: *{len(sources)}*\n"
+            f"📖 Messaggi letti per fonte: *{limit}*\n\n"
+            "La scansione ora gira in background.\n"
+            "Puoi continuare a usare il bot: categorie, impostazioni e dashboard restano disponibili.\n\n"
+            "Quando finisce aggiorno automaticamente questo messaggio con i risultati.",
+            reply_markup=build_telegram_sources_menu(user_id),
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+        context.application.create_task(
+            run_telegram_sources_scan_background(
+                context=context,
+                user_id=user_id,
+                chat_id=query.message.chat_id,
+                message_id=query.message.message_id,
+                sources=sources,
+                limit=limit,
+            )
+        )
+        return
+
+    # -------------------------------------------------------------------------
+    # BUFFER DASHBOARD
+    # -------------------------------------------------------------------------
+    if data == "buffer_dashboard":
+        keyboard = [[InlineKeyboardButton("🔙 Dashboard", callback_data="back_to_menu")]]
+        await query.edit_message_text(
+            build_buffer_dashboard_text(user_id),
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=ParseMode.MARKDOWN
         )
         return
@@ -1044,7 +1992,12 @@ async def category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # -------------------------------------------------------------------------
     if data == "connect_menu":
         await query.edit_message_text(
-            "🔗 *Collega i tuoi canali e social*\n\nScegli una piattaforma da configurare:",
+            "🔗 *Canali e social*\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "Collega le destinazioni dove pubblicare le offerte.\n\n"
+            "📣 Telegram: consigliato per la pubblicazione principale\n"
+            "📘 Facebook: opzionale\n"
+            "📷 Instagram: opzionale",
             reply_markup=build_connect_menu(),
             parse_mode=ParseMode.MARKDOWN
         )
@@ -1211,7 +2164,13 @@ async def category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # -------------------------------------------------------------------------
     if data == "timing_menu":
         await query.edit_message_text(
-            "⏱️ *Gestione dei tempi*\n\nConfigura frequenza, attese e giorni attivi.",
+            "⏱️ *Tempi di pubblicazione*\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"📆 Intervallo attuale: *{get_user_post_interval(user_id)} min*\n"
+            f"🔢 Offerte per categoria: *{get_user_offers_per_cycle(user_id)}*\n"
+            f"🕒 Ripubblicazione stesso ASIN: *dopo {get_user_days_limit(user_id)} giorni*\n"
+            f"🧹 Pulizia buffer: *{get_user_buffer_clear_days(user_id) or 'manuale'}*\n\n"
+            "Configura frequenza, limiti e giorni attivi.",
             reply_markup=build_timing_menu(),
             parse_mode=ParseMode.MARKDOWN
         )
@@ -1507,6 +2466,106 @@ async def category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # -------------------------------------------------------------------------
+    # SCROLL CATEGORIE
+    # -------------------------------------------------------------------------
+    if data == "category_scrolls_menu":
+        await query.edit_message_text(
+            build_category_scrolls_text(user_id),
+            reply_markup=build_category_scrolls_menu(user_id),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    if data == "category_scrolls_guide":
+        keyboard = [
+            [InlineKeyboardButton("🔃 Imposta scroll", callback_data="category_scrolls_menu")],
+            [InlineKeyboardButton("🔙 Impostazioni", callback_data="settings")],
+        ]
+        await query.edit_message_text(
+            build_category_scrolls_guide_text(user_id),
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    if data.startswith("category_scrolls_") and data != "category_scrolls_guide":
+        value = int(data.rsplit("_", 1)[1])
+        set_user_category_scrolls(user_id, value)
+        await query.answer(f"🔃 Scroll categorie impostati a {value}")
+
+        users = load_user_data()
+        categories = users.get(str(user_id), {}).get("categories", [])
+        for cat_code in categories:
+            try:
+                delete_buffer_file(user_id, cat_code)
+                logger.info(f"[SCROLL] Buffer cancellato dopo cambio scroll: {user_id}_{cat_code}")
+            except Exception:
+                logger.exception(f"[SCROLL] Errore cancellazione buffer {user_id}_{cat_code}")
+
+        await query.edit_message_text(
+            f"✅ *Scroll categorie aggiornati*\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"Nuovo valore: *{value} scroll*\n\n"
+            "Ho cancellato i buffer delle categorie attive, così il prossimo refill userà subito la nuova profondità di scansione.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔃 Torna agli scroll", callback_data="category_scrolls_menu")],
+                [InlineKeyboardButton("🔙 Impostazioni", callback_data="settings")],
+            ]),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    # -------------------------------------------------------------------------
+    # PAGINE CATEGORIE
+    # -------------------------------------------------------------------------
+    if data == "category_pages_menu":
+        await query.edit_message_text(
+            build_category_pages_text(user_id),
+            reply_markup=build_category_pages_menu(user_id),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    if data == "category_pages_guide":
+        keyboard = [
+            [InlineKeyboardButton("📄 Imposta pagine", callback_data="category_pages_menu")],
+            [InlineKeyboardButton("🔙 Impostazioni", callback_data="settings")],
+        ]
+        await query.edit_message_text(
+            build_category_pages_guide_text(user_id),
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    if data.startswith("category_pages_") and data != "category_pages_guide":
+        value = int(data.rsplit("_", 1)[1])
+        set_user_category_pages(user_id, value)
+        await query.answer(f"📄 Pagine categorie impostate a {value}")
+
+        users = load_user_data()
+        categories = users.get(str(user_id), {}).get("categories", [])
+        for cat_code in categories:
+            try:
+                delete_buffer_file(user_id, cat_code)
+                logger.info(f"[PAGES] Buffer cancellato dopo cambio pagine: {user_id}_{cat_code}")
+            except Exception:
+                logger.exception(f"[PAGES] Errore cancellazione buffer {user_id}_{cat_code}")
+
+        await query.edit_message_text(
+            f"✅ *Pagine categorie aggiornate*\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"Nuovo valore: *{value} pagine*\n\n"
+            "Ho cancellato i buffer delle categorie attive, così il prossimo refill userà subito la nuova profondità di scansione.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📄 Torna alle pagine", callback_data="category_pages_menu")],
+                [InlineKeyboardButton("🔙 Impostazioni", callback_data="settings")],
+            ]),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    # -------------------------------------------------------------------------
     # FILTRI
     # -------------------------------------------------------------------------
     if data == "filters":
@@ -1570,7 +2629,7 @@ async def category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup = build_category_keyboard(user_id)
         try:
             await query.edit_message_text(
-                text="📂 *Seleziona le categorie che desideri monitorare:*",
+                text=build_category_text(user_id),
                 reply_markup=reply_markup,
                 parse_mode=ParseMode.MARKDOWN
             )
@@ -1578,7 +2637,7 @@ async def category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.warning(f"[CATEGORIES] edit_message_text fallita: {e}")
             await context.bot.send_message(
                 chat_id=query.message.chat.id,
-                text="📂 *Seleziona le categorie che desideri monitorare:*",
+                text=build_category_text(user_id),
                 reply_markup=reply_markup,
                 parse_mode=ParseMode.MARKDOWN
             )
@@ -1589,9 +2648,100 @@ async def category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # -------------------------------------------------------------------------
     if data == "back_to_menu":
         await query.edit_message_text(
-            build_welcome_text(user.first_name),
+            build_welcome_text(user.first_name, user_id),
             reply_markup=build_main_menu(user_id),
             parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    # -------------------------------------------------------------------------
+    # ADMIN: GESTIONE LICENZE
+    # -------------------------------------------------------------------------
+    if data == "admin_license_menu":
+        if not is_admin(user_id):
+            await query.answer("🚫 Solo admin", show_alert=True)
+            return
+
+        context.user_data.pop("awaiting_admin_license_user_id", None)
+        context.user_data.pop("awaiting_admin_license_custom_days", None)
+        context.user_data.pop("admin_license_days", None)
+        context.user_data["admin_license_prompt_msg_id"] = query.message.message_id
+
+        await query.edit_message_text(
+            build_admin_license_text(),
+            reply_markup=build_admin_license_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    if data.startswith("admin_license_days_"):
+        if not is_admin(user_id):
+            await query.answer("🚫 Solo admin", show_alert=True)
+            return
+
+        days = int(data.rsplit("_", 1)[1])
+        context.user_data["awaiting_admin_license_user_id"] = True
+        context.user_data["admin_license_days"] = days
+        context.user_data["admin_license_prompt_msg_id"] = query.message.message_id
+
+        await query.edit_message_text(
+            (
+                "👑 *Gestione Licenze Admin*\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"✅ Durata scelta: *{days} giorni*\n\n"
+                "Ora inviami il *Telegram ID* dell’utente da attivare.\n\n"
+                "Esempio: `1271567510`"
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Annulla", callback_data="admin_license_menu")]])
+        )
+        return
+
+    if data == "admin_license_custom_days":
+        if not is_admin(user_id):
+            await query.answer("🚫 Solo admin", show_alert=True)
+            return
+
+        context.user_data["awaiting_admin_license_custom_days"] = True
+        context.user_data["admin_license_prompt_msg_id"] = query.message.message_id
+
+        await query.edit_message_text(
+            (
+                "✏️ *Durata manuale licenza*\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "Inviami il numero di giorni da assegnare.\n\n"
+                "Esempio: `30`"
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Annulla", callback_data="admin_license_menu")]])
+        )
+        return
+
+    if data == "admin_license_users":
+        if not is_admin(user_id):
+            await query.answer("🚫 Solo admin", show_alert=True)
+            return
+
+        users = load_user_data()
+        rows = []
+        for uid, info in users.items():
+            status = "✅" if license_is_valid(info) else "⚠️" if info.get("has_license") else "❌"
+            exp = info.get("license_expires", "-")
+            rows.append(f"{status} `{uid}` · {exp}")
+
+        if not rows:
+            body = "Nessun utente registrato."
+        else:
+            body = "\n".join(rows[:30])
+            if len(rows) > 30:
+                body += f"\n… altri {len(rows) - 30} utenti"
+
+        await query.edit_message_text(
+            "📋 *Utenti registrati*\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"{body}",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Gestione Licenze", callback_data="admin_license_menu")]])
         )
         return
 
@@ -1608,8 +2758,12 @@ async def category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         keyboard = [
             [InlineKeyboardButton("🏷️ Imposta Tag Affiliato", callback_data="set_tag")],
-            [InlineKeyboardButton("🔙 Torna alle Impostazioni", callback_data="settings")]
         ]
+
+        if is_admin(user_id):
+            keyboard.append([InlineKeyboardButton("👑 Gestisci Licenze", callback_data="admin_license_menu")])
+
+        keyboard.append([InlineKeyboardButton("🔙 Torna alle Impostazioni", callback_data="settings")])
 
         await query.edit_message_text(
             f"🎟️ *Licenza & Affiliazione*\n\n{stato}",
@@ -1634,6 +2788,167 @@ async def category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✏️ Inviami ora il tuo *Tag Affiliato Amazon*\n\nEsempio: `ilmionome-21`",
             parse_mode=ParseMode.MARKDOWN
         )
+        return
+
+    # -------------------------------------------------------------------------
+    # ADMIN: ATTIVAZIONE LICENZA DA PANNELLO
+    # -------------------------------------------------------------------------
+    if context.user_data.get("awaiting_admin_license_custom_days"):
+        if not is_admin(user_id):
+            context.user_data.pop("awaiting_admin_license_custom_days", None)
+            await update.message.reply_text("🚫 Operazione riservata all’amministratore.")
+            return
+
+        try:
+            days = int(text.strip())
+            if days <= 0 or days > 3650:
+                raise ValueError
+        except Exception:
+            await update.message.reply_text("❌ Durata non valida. Invia un numero di giorni, esempio: `30`", parse_mode=ParseMode.MARKDOWN)
+            return
+
+        context.user_data["awaiting_admin_license_custom_days"] = False
+        context.user_data["awaiting_admin_license_user_id"] = True
+        context.user_data["admin_license_days"] = days
+
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+        prompt_id = context.user_data.get("admin_license_prompt_msg_id")
+        text_msg = (
+            "👑 *Gestione Licenze Admin*\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"✅ Durata scelta: *{days} giorni*\n\n"
+            "Ora inviami il *Telegram ID* dell’utente da attivare.\n\n"
+            "Esempio: `1271567510`"
+        )
+        if prompt_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=prompt_id,
+                    text=text_msg,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Annulla", callback_data="admin_license_menu")]])
+                )
+            except Exception:
+                await context.bot.send_message(chat_id=chat_id, text=text_msg, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=text_msg, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if context.user_data.get("awaiting_admin_license_user_id"):
+        from src.utils.license_manager import attiva_licenza
+
+        if not is_admin(user_id):
+            context.user_data.pop("awaiting_admin_license_user_id", None)
+            await update.message.reply_text("🚫 Operazione riservata all’amministratore.")
+            return
+
+        days = int(context.user_data.get("admin_license_days", 30))
+        try:
+            target_user_id = int(text.strip())
+        except Exception:
+            await update.message.reply_text("❌ Telegram ID non valido. Invia solo numeri, esempio: `1271567510`", parse_mode=ParseMode.MARKDOWN)
+            return
+
+        try:
+            attiva_licenza(target_user_id, days)
+            data = load_user_data()
+            exp = data.get(str(target_user_id), {}).get("license_expires", "?")
+            notified = await notify_user_license_activated(context.bot, target_user_id, days, exp)
+
+            context.user_data.pop("awaiting_admin_license_user_id", None)
+            context.user_data.pop("admin_license_days", None)
+
+            try:
+                await update.message.delete()
+            except Exception:
+                pass
+
+            result_text = (
+                "✅ *Licenza attivata*\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"👤 Utente: `{target_user_id}`\n"
+                f"⏳ Durata: *{days} giorni*\n"
+                f"📅 Scadenza: *{exp}*\n"
+                f"📩 Notifica utente: *{'inviata' if notified else 'non inviata'}*\n\n"
+                "Puoi attivare un’altra licenza oppure tornare al pannello."
+            )
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Attiva altra licenza", callback_data="admin_license_menu")],
+                [InlineKeyboardButton("🔙 Licenza & Affiliazione", callback_data="license_menu")],
+            ])
+
+            prompt_id = context.user_data.get("admin_license_prompt_msg_id")
+            if prompt_id:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=prompt_id,
+                        text=result_text,
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=keyboard
+                    )
+                except Exception:
+                    await context.bot.send_message(chat_id=chat_id, text=result_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=result_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+
+        except Exception as e:
+            logger.exception("[ADMIN_LICENSE] Errore attivazione da pannello")
+            await update.message.reply_text(f"⚠️ Errore attivazione licenza: `{e}`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # -------------------------------------------------------------------------
+    # FONTI TELEGRAM: AGGIUNGI CANALE SORGENTE
+    # -------------------------------------------------------------------------
+    if context.user_data.get("awaiting_telegram_source_channel"):
+        from src.telegram_sources.importer import normalize_channel_name
+
+        clean = normalize_channel_name(text)
+        if not clean:
+            await update.message.reply_text(
+                "❌ Canale non valido. Inviami un canale pubblico, esempio: `@nomecanale` oppure `https://t.me/nomecanale`.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+
+        try:
+            add_user_telegram_source_channel(user_id, clean)
+            context.user_data["awaiting_telegram_source_channel"] = False
+            try:
+                await update.message.delete()
+            except Exception:
+                pass
+
+            msg_text = (
+                "✅ *Fonte Telegram aggiunta*\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"Canale: `{clean}`\n\n"
+                "Ho attivato automaticamente anche la categoria *Fonti Telegram 📥*.\n"
+                "Ora puoi premere *Scansiona ora* per importare le offerte nel buffer."
+            )
+            keyboard = build_telegram_sources_menu(user_id)
+            prompt_id = context.user_data.get("telegram_source_prompt_msg_id")
+            if prompt_id:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=prompt_id,
+                        text=msg_text,
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=keyboard
+                    )
+                except Exception:
+                    await context.bot.send_message(chat_id=chat_id, text=msg_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=msg_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+        except Exception as exc:
+            logger.exception("[TG-SOURCES] Errore salvataggio canale sorgente")
+            await update.message.reply_text(f"⚠️ Errore salvataggio fonte: `{exc}`", parse_mode=ParseMode.MARKDOWN)
         return
 
     # -------------------------------------------------------------------------

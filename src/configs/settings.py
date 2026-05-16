@@ -68,3 +68,8 @@ INVALID_BUFFER_QUARANTINE_HOURS = _as_int(os.getenv("INVALID_BUFFER_QUARANTINE_H
 # Social opzionali
 ENABLE_FACEBOOK_POSTING = _as_bool(os.getenv("ENABLE_FACEBOOK_POSTING"), True)
 ENABLE_INSTAGRAM_POSTING = _as_bool(os.getenv("ENABLE_INSTAGRAM_POSTING"), True)
+
+# Dettaglio ASIN / recupero prezzi mancanti
+# Se PA-API/HTML non trovano il prezzo, Selenium viene usato come ultima spiaggia.
+ASIN_DETAIL_ENABLE_SELENIUM_FALLBACK = _as_bool(os.getenv("ASIN_DETAIL_ENABLE_SELENIUM_FALLBACK"), True)
+ASIN_DETAIL_SELENIUM_MAX_PER_REFILL = _as_int(os.getenv("ASIN_DETAIL_SELENIUM_MAX_PER_REFILL"), 1)

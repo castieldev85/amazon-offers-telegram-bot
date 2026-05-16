@@ -1,48 +1,37 @@
 # Python
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
-.Python
 venv/
 .venv/
-env/
-ENV/
 
-# Ambiente / segreti
+# Secrets / env
 .env
 .env.*
 !.env.example
 
-# Log
-*.log
-log.txt
-bot.log
-scheduler_error.log
+# Telegram user sessions (Telethon)
+*.session
+*.session-journal
+telegram_user.session*
 
-# Dati runtime
+# Runtime data
 user_data.json
+telegram_sources.json
 link_map.json
+published_products.json
 rejected_offers.json
 *.db
 *.sqlite
 *.sqlite3
 
-# Buffer e risultati
-buffer_storage/*.json
-search_results/*.json
+# Logs / temp
+*.log
 temp/
 tmp/
+buffer_storage/*.json
+search_results/*.json
 
-# Sistema
+# OS
 .DS_Store
 ._*
 Thumbs.db
-
-# IDE
-.vscode/
-.idea/
-
-# Output
-*.zip
-*.rar

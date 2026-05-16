@@ -11,7 +11,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from datetime import datetime
 import random
 from telegram.error import RetryAfter, TimedOut, NetworkError
-from src.utils.offer_scorer import score_super_offer, estimate_final_price, build_offer_debug_summary, parse_price
+from src.utils.offer_scorer import score_super_offer, estimate_final_price, build_offer_debug_summary, parse_price, get_effective_discount_percent
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -21,6 +21,7 @@ from src.database.user_data_manager import (
     get_user_categories,
     get_user_post_interval,
     get_user_offers_per_cycle,
+    get_user_min_discount,
 )
 from src.buffer.buffer_manager import (
     load_buffered_products,
@@ -39,7 +40,12 @@ from src.utils.shortlink_generator import generate_affiliate_link
 from src.utils.image_builder import crea_immagine_offerta_da_url
 from src.utils.database_builder import is_valid_for_resend
 from src.utils.facebook import publish_offer_to_facebook
-from src.configs.schedule_config import is_within_active_schedule, next_active_datetime, format_schedule_status
+from src.configs.schedule_config import (
+    is_within_active_schedule,
+    next_active_datetime,
+    next_allowed_timestamp_after_interval,
+    format_schedule_status,
+)
 from src.configs.settings import (
     AUTOPOST_SLEEP_SECONDS,
     ENABLE_FACEBOOK_POSTING,
@@ -92,6 +98,95 @@ if not logger.handlers:
 
 WATCHLIST_CHECK_INTERVAL = WATCHLIST_CHECK_INTERVAL_SECONDS
 REFILL_CHECK_INTERVAL = REFILL_CHECK_INTERVAL_SECONDS
+
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on", "si", "sì"}
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        raw = os.getenv(name, "").strip()
+        return float(raw.replace(",", ".")) if raw else float(default)
+    except Exception:
+        return float(default)
+
+
+def _price_diff_percent(a, b) -> float:
+    a = parse_price(a)
+    b = parse_price(b)
+    if a is None or b is None or a <= 0 or b <= 0:
+        return 0.0
+    return abs(a - b) / max(a, b) * 100.0
+
+
+def _revalidate_telegram_source_product(prod):
+    """Prima di pubblicare una fonte Telegram, ricontrolla il prezzo live Amazon.
+
+    Le fonti esterne possono essere vecchie, riferite a una variante diversa o avere prezzi
+    non più attuali. Per evitare post con prezzo sbagliato, qui il prezzo Amazon live vince
+    sempre. Se non riusciamo a verificare il prezzo e TELEGRAM_SOURCE_ALLOW_UNVERIFIED_PRICE
+    non è true, l'offerta viene saltata.
+    """
+    asin = str(getattr(prod, "asin", "") or "").strip().upper()
+    if not asin:
+        return None
+
+    allow_unverified = _env_bool("TELEGRAM_SOURCE_ALLOW_UNVERIFIED_PRICE", False)
+    max_diff = _env_float("TELEGRAM_SOURCE_PRICE_MAX_DIFF_PERCENT", 12.0)
+
+    try:
+        live = extract_product_info(asin)
+    except Exception:
+        logger.exception(f"[AUTOPOST][TG-SOURCES] Errore verifica prezzo live asin={asin}")
+        live = None
+
+    live_price = parse_price(getattr(live, "price", None)) if live else None
+    buffer_price = parse_price(getattr(prod, "price", None))
+
+    if live and live_price and live_price > 0:
+        if buffer_price and buffer_price > 0:
+            diff = _price_diff_percent(live_price, buffer_price)
+            if diff > max_diff:
+                logger.warning(
+                    f"[AUTOPOST][TG-SOURCES] Prezzo aggiornato per asin={asin}: "
+                    f"buffer={buffer_price:.2f}€ live={live_price:.2f}€ diff={diff:.1f}%. Uso prezzo live."
+                )
+
+        # Mantieni categoria/link fonte, ma usa dati economici live.
+        live.category = getattr(prod, "category", None) or "Offerte Telegram"
+        if getattr(prod, "link", None):
+            live.link = prod.link
+        if not getattr(live, "image", None) and getattr(prod, "image", None):
+            live.image = prod.image
+
+        # Se Amazon non ha old_price ma il buffer ha un old_price coerente con il live, usalo.
+        live_old = parse_price(getattr(live, "old_price", None))
+        buf_old = parse_price(getattr(prod, "old_price", None))
+        if (not live_old or live_old <= live_price) and buf_old and buf_old > live_price:
+            disc = ((buf_old - live_price) / buf_old) * 100.0
+            if 5 <= disc <= 70 and (buf_old / live_price) <= 4.0:
+                live.old_price = round(buf_old, 2)
+                live.discount = round(disc, 1)
+
+        return live
+
+    if allow_unverified and buffer_price and buffer_price > 0:
+        logger.warning(
+            f"[AUTOPOST][TG-SOURCES] Prezzo live non verificato per asin={asin}. "
+            f"Pubblico prezzo fonte perché TELEGRAM_SOURCE_ALLOW_UNVERIFIED_PRICE=true."
+        )
+        return prod
+
+    logger.warning(
+        f"[AUTOPOST][TG-SOURCES] Skip asin={asin}: prezzo live Amazon non verificato. "
+        f"Evito pubblicazione con prezzo fonte potenzialmente errato."
+    )
+    return None
 
 def _update_last_buffer_clear(user_id: int, timestamp: float):
     users = load_user_data()
@@ -224,6 +319,11 @@ async def autopost_loop(app):
                 except Exception:
                     offers_per_category = max(1, int(MAX_OFFERS_PER_USER_CYCLE))
 
+                try:
+                    user_min_discount = float(get_user_min_discount(user_id) or 0)
+                except Exception:
+                    user_min_discount = 0.0
+
                 # V2.8: il numero impostato dall'utente vale PER OGNI CATEGORIA.
                 # Se una categoria ha buffer pieno ma nessuna offerta valida, il buffer viene
                 # eliminato e viene avviata subito una nuova scansione/refill. Gli ASIN scartati
@@ -256,11 +356,22 @@ async def autopost_loop(app):
                                 blocked_or_duplicate_count += 1
                                 continue
 
+                            effective_discount = get_effective_discount_percent(prod, category=cat)
+                            if effective_discount < user_min_discount:
+                                rejected_low_score_asins.append(asin)
+                                logger.info(
+                                    f"[AUTOPOST] Skip {asin}: sconto_effettivo={effective_discount}% < "
+                                    f"filtro_utente={user_min_discount}% | "
+                                    f"{build_offer_debug_summary(prod, category=cat)}"
+                                )
+                                continue
+
                             score = _offer_score(prod, cat)
                             if score < MIN_OFFER_SCORE:
                                 rejected_low_score_asins.append(asin)
                                 logger.info(
                                     f"[AUTOPOST] Skip {asin}: score={score} < {MIN_OFFER_SCORE} | "
+                                    f"sconto_effettivo={effective_discount}% | "
                                     f"{build_offer_debug_summary(prod, category=cat)}"
                                 )
                                 continue
@@ -314,7 +425,7 @@ async def autopost_loop(app):
 
                 logger.info(
                     f"[AUTOPOST] User={user_id}: ciclo con {len(categories)} categorie attive, "
-                    f"{offers_per_category} offerte per categoria, totale selezionate={len(selected)}"
+                    f"{offers_per_category} offerte per categoria, filtro sconto={user_min_discount}%, totale selezionate={len(selected)}"
                 )
                 published_any = False
 
@@ -325,33 +436,87 @@ async def autopost_loop(app):
                     instagram_ok = False
 
                     try:
+                        if cat == "cat_telegram_sources":
+                            verified_prod = await asyncio.to_thread(_revalidate_telegram_source_product, prod)
+                            if not verified_prod:
+                                try:
+                                    mark_rejected_asins(user_id, cat, [str(getattr(prod, 'asin', '') or '').upper()], reason="telegram_source_price_not_verified")
+                                    remove_posted_asins(user_id, cat, [prod])
+                                except Exception:
+                                    logger.exception(f"[AUTOPOST] Errore rimozione fonte Telegram non verificata asin={getattr(prod, 'asin', 'N/D')}")
+                                continue
+                            prod = verified_prod
+
+                        # Guard rail V3.27: ricontrollo l'orario subito prima di ogni invio.
+                        # Se la scansione/validazione è durata a lungo ed è finita la fascia oraria,
+                        # non pubblico comunque l'offerta.
+                        if not is_within_active_schedule(user_id):
+                            next_dt = next_active_datetime(user_id)
+                            users_latest = load_user_data()
+                            users_latest.setdefault(uid_str, {})
+                            if next_dt is not None:
+                                users_latest[uid_str]["next_post"] = next_dt.timestamp()
+                                save_user_data(users_latest)
+                                logger.info(
+                                    f"[AUTOPOST] Finestra oraria chiusa prima dell'invio user={user_id}. "
+                                    f"Blocco pubblicazione e riprovo alle {next_dt.strftime('%d/%m %H:%M')}."
+                                )
+                            else:
+                                save_user_data(users_latest)
+                                logger.info(f"[AUTOPOST] Finestra oraria chiusa prima dell'invio user={user_id}. Blocco pubblicazione.")
+                            selected = []
+                            break
+
                         category_name = getattr(prod, "category", None) or cat.replace("cat_", "").replace("_", " ").title()
                         logger.info(
                             f"[AUTOPOST] Pubblico candidato {prod.asin} user={user_id} cat={cat} score={score} | "
                             f"{build_offer_debug_summary(prod, category=cat)}"
                         )
 
-                        img = await asyncio.to_thread(
-                            crea_immagine_offerta_da_url,
-                            prod.image,
-                            prod.price,
-                            prod.discount,
-                            prod.old_price,
-                            prod.asin,
-                        )
+                        try:
+                            img = await asyncio.to_thread(
+                                crea_immagine_offerta_da_url,
+                                prod.image,
+                                prod.price,
+                                prod.discount,
+                                prod.old_price,
+                                prod.asin,
+                            )
+                        except Exception as image_exc:
+                            # V3.25: non pubblichiamo più offerte senza foto prodotto reale.
+                            # Il placeholder rovina la qualità del canale, soprattutto sulle fonti Telegram.
+                            logger.warning(
+                                f"[AUTOPOST] Skip asin={prod.asin}: nessuna immagine prodotto reale. "
+                                f"Rimuovo dal buffer e proseguo. Errore: {image_exc}"
+                            )
+                            try:
+                                mark_rejected_asins(user_id, cat, [str(getattr(prod, 'asin', '') or '').upper()], reason="missing_product_image")
+                                remove_posted_asins(user_id, cat, [prod])
+                            except Exception:
+                                logger.exception(f"[AUTOPOST] Errore rimozione prodotto senza immagine asin={getattr(prod, 'asin', 'N/D')}")
+                            continue
 
                         text, markup = build_offer_message(prod, user_id, category_name=category_name)
                         targets = data.get("telegram_channels") or [user_id]
 
                         for ch in targets:
                             try:
-                                with open(img, "rb") as fh:
-                                    await app.bot.send_photo(
+                                if img:
+                                    with open(img, "rb") as fh:
+                                        await app.bot.send_photo(
+                                            chat_id=ch,
+                                            photo=fh,
+                                            caption=text,
+                                            reply_markup=markup,
+                                            parse_mode=ParseMode.MARKDOWN_V2,
+                                        )
+                                else:
+                                    await app.bot.send_message(
                                         chat_id=ch,
-                                        photo=fh,
-                                        caption=text,
+                                        text=text,
                                         reply_markup=markup,
                                         parse_mode=ParseMode.MARKDOWN_V2,
+                                        disable_web_page_preview=False,
                                     )
                                 logger.info(f"[AUTOPOST] Inviato Telegram a {ch} asin={prod.asin}")
                                 telegram_ok = True
@@ -400,9 +565,14 @@ async def autopost_loop(app):
                     interval = data.get("post_interval", get_user_post_interval(user_id))
                     users_latest = load_user_data()
                     users_latest.setdefault(uid_str, {})
-                    users_latest[uid_str]["next_post"] = time.time() + int(interval) * 60
+                    next_ts = next_allowed_timestamp_after_interval(user_id, int(interval))
+                    users_latest[uid_str]["next_post"] = next_ts
                     save_user_data(users_latest)
-                    logger.info(f"[AUTOPOST] Prossimo post user={user_id} tra {interval} minuti")
+                    next_human = datetime.fromtimestamp(next_ts).strftime("%d/%m %H:%M")
+                    logger.info(
+                        f"[AUTOPOST] Prossimo post user={user_id} tra {interval} minuti "
+                        f"(rispettando orari: {next_human})"
+                    )
 
         except Exception:
             logger.exception("[AUTOPOST] Errore generale loop V2")
@@ -427,6 +597,29 @@ async def refill_loop():
                     try:
                         buffer_products = load_buffered_products(user_id, cat)
                         if not buffer_products or needs_refill(user_id, cat):
+                            # Categoria speciale: fonti Telegram. Non usa lo scraper ASIN classico:
+                            # quando il buffer scende sotto il minimo, riscansiona i canali salvati.
+                            if cat == "cat_telegram_sources":
+                                try:
+                                    from src.telegram_sources.source_store import get_sources
+                                    from src.telegram_sources.importer import import_channel_offers_to_buffer
+                                    sources = get_sources(user_id)
+                                    if not sources:
+                                        logger.info(f"[REFILL_LOOP] Fonti Telegram vuote per user={user_id}, nessun refill.")
+                                    else:
+                                        logger.info(
+                                            f"[REFILL_LOOP] 🔄 Buffer fonti Telegram sotto minimo "
+                                            f"({len(buffer_products) if buffer_products else 0}). Scansiono {len(sources)} fonti salvate."
+                                        )
+                                        for source in sources:
+                                            try:
+                                                import_channel_offers_to_buffer(user_id, source, limit=30)
+                                            except Exception:
+                                                logger.exception(f"[REFILL_LOOP] Errore scansione fonte Telegram {source}")
+                                except Exception:
+                                    logger.exception(f"[REFILL_LOOP] Errore refill fonti Telegram per user={user_id}")
+                                continue
+
                             src_fn = CATEGORY_SOURCE_MAP.get(cat)
                             if src_fn:
                                 logger.info(f"[REFILL_LOOP] 🔄 Avvio refill per {user_id}_{cat} (buffer attualmente {len(buffer_products) if buffer_products else 0})")
@@ -710,8 +903,9 @@ def initialize_next_post_for_users():
 
             current_next_post = data.get("next_post", 0)
             if not current_next_post or current_next_post < 0:
-                users[uid_str]["next_post"] = now + interval * 60
-                logger.info(f"[STARTUP] ⏲️ Scheduling next_post per {user_id} tra {interval}m")
+                users[uid_str]["next_post"] = next_allowed_timestamp_after_interval(user_id, int(interval))
+                next_human = datetime.fromtimestamp(users[uid_str]["next_post"]).strftime("%d/%m %H:%M")
+                logger.info(f"[STARTUP] ⏲️ Scheduling next_post per {user_id}: {next_human}")
             else:
                 logger.info(f"[STARTUP] ℹ️ next_post già presente per {user_id}: {current_next_post}")
 

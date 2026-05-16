@@ -442,6 +442,60 @@ def score_super_offer(product, category: Optional[str] = None) -> float:
     return round(score, 2)
 
 
+
+def get_effective_discount_percent(product, category: Optional[str] = None) -> float:
+    """
+    Restituisce lo sconto realmente utilizzabile per i filtri utente.
+
+    Regola V3.2:
+    - il filtro sconto impostato dall'utente deve essere obbligatorio;
+    - un prodotto con score alto non può bypassare il filtro sconto;
+    - se il vecchio prezzo non è credibile, lo sconto base viene considerato 0;
+    - coupon/promo vengono contati solo se abbassano davvero il prezzo finale.
+    """
+    info = estimate_final_price(product)
+
+    current_price = info.get("current_price")
+    old_price = info.get("old_price")
+    estimated_final = info.get("estimated_final_price")
+
+    if current_price is None or current_price <= 0:
+        return 0.0
+
+    old_is_reliable = bool(old_price and is_reasonable_old_price(current_price, old_price, category))
+
+    base_discount = 0.0
+    if old_is_reliable:
+        base_discount = ((old_price - current_price) / old_price) * 100.0
+
+    total_discount = base_discount
+
+    if estimated_final is not None and estimated_final > 0 and estimated_final < current_price:
+        if old_is_reliable:
+            total_discount = ((old_price - estimated_final) / old_price) * 100.0
+        else:
+            total_discount = ((current_price - estimated_final) / current_price) * 100.0
+
+    if total_discount < 0:
+        return 0.0
+    if total_discount > 100:
+        return 0.0
+
+    return round(total_discount, 2)
+
+
+def passes_user_min_discount(product, min_discount: int | float, category: Optional[str] = None) -> bool:
+    """True solo se l'offerta rispetta il filtro sconto impostato dall'utente."""
+    try:
+        required = float(min_discount or 0)
+    except Exception:
+        required = 0.0
+
+    if required <= 0:
+        return True
+
+    return get_effective_discount_percent(product, category=category) >= required
+
 def is_super_offer(product, category: Optional[str] = None, threshold: float = 55.0) -> bool:
     return score_super_offer(product, category=category) >= threshold
 
@@ -452,9 +506,11 @@ def build_offer_debug_summary(product, category: Optional[str] = None) -> str:
 
     coupon_info = info["coupon_info"]
     promo_info = info["promo_info"]
+    effective_discount = get_effective_discount_percent(product, category=category)
 
     return (
         f"score={score} | "
+        f"effective_discount={effective_discount} | "
         f"price={info['current_price']} | "
         f"old={info['old_price']} | "
         f"final={info['estimated_final_price']} | "
