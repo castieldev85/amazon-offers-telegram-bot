@@ -449,6 +449,15 @@ The maintainer is not responsible for misuse, policy violations, account restric
 
 ---
 
+## Project Signature
+
+This repository includes static project identification strings for attribution and license verification.
+
+Canonical repository:
+
+```text
+https://github.com/castieldev85/amazon-offers-telegram-bot
+
 ## License
 
 This project is **not open source**.
